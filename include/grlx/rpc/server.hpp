@@ -61,10 +61,10 @@ public:
       sessions_strand_ = std::make_unique<asio::strand<typename ChannelT::executor_type>>(asio::make_strand(channel_.get_executor()));
     }
 
-    if (!logger_) {
-      logger_ = std::make_shared<async_logger>(executor);
-      logger_->start();
-    }
+    // if (!logger_) {
+    //   logger_ = std::make_shared<async_logger>(executor);
+    //   logger_->start();
+    // }
 
     asio::co_spawn(
         executor,
@@ -253,27 +253,27 @@ public:
 private:
   // Helper methods for non-blocking logging
   void log_error_async(const std::string& message) {
-    if (logger_) {
-      asio::co_spawn(
-          logger_->strand_,
-          [this, message]() -> asio::awaitable<void> {
-            co_await logger_->error(message);
-            co_return;
-          },
-          asio::detached);
-    }
+    // if (logger_) {
+    //   asio::co_spawn(
+    //       logger_->strand_,
+    //       [this, message]() -> asio::awaitable<void> {
+    //         co_await logger_->error(message);
+    //         co_return;
+    //       },
+    //       asio::detached);
+    // }
   }
 
   void log_warning_async(const std::string& message) {
-    if (logger_) {
-      asio::co_spawn(
-          logger_->strand_,
-          [this, message]() -> asio::awaitable<void> {
-            co_await logger_->warning(message);
-            co_return;
-          },
-          asio::detached);
-    }
+    // if (logger_) {
+    //   asio::co_spawn(
+    //       logger_->strand_,
+    //       [this, message]() -> asio::awaitable<void> {
+    //         co_await logger_->warning(message);
+    //         co_return;
+    //       },
+    //       asio::detached);
+    // }
   }
 
 private:

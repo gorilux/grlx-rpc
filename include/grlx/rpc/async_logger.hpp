@@ -131,6 +131,11 @@ private:
         co_await flush_timer_.async_wait(asio::use_awaitable);
         if (!is_stopped_.load()) {
           flush_pending_logs();
+
+          // Always reset the timer for the next iteration to prevent busy loop
+          // If there are pending logs, they'll be flushed on next timeout
+          // If no logs, we'll wait the full interval before checking again
+          flush_timer_.expires_after(flush_interval_);
         }
       } catch (const boost::system::system_error& e) {
         if (e.code() == asio::error::operation_aborted) {
@@ -170,11 +175,6 @@ private:
       }
 
       pending_logs_.pop();
-    }
-
-    // Reset timer for next batch
-    if (!pending_logs_.empty()) {
-      flush_timer_.expires_after(flush_interval_);
     }
   }
 
