@@ -20,6 +20,16 @@ if system == 'emscripten'
   grlx_rpc_deps += [
     dependency('boost', modules: ['system']),
   ]
+elif system == 'android'
+  # Boost has no .pc file; point to the Android libs include directory
+  # spdlog shim provides a lightweight Android-native logging replacement
+  spdlog_shim_dir = meson.global_source_root() / 'cross' / 'android-spdlog-shim'
+  grlx_rpc_deps += [
+    declare_dependency(compile_args: [
+      '-isystem', '/opt/android-libs/aarch64/include',
+      '-isystem', spdlog_shim_dir,
+    ]),
+  ]
 else
   # Native platform dependencies
   grlx_rpc_deps += [
@@ -59,7 +69,7 @@ set_variable('grlx_rpc_dep', grlx_rpc_dep)
 # Unit Tests
 # ==========
 
-if not meson.is_subproject() and system != 'emscripten'
+if not meson.is_subproject() and system != 'emscripten' and system != 'android'
   subdir('test')
 endif
 

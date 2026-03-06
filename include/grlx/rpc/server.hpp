@@ -167,35 +167,25 @@ public:
         },
         asio::use_awaitable);
 
-    // Notify all sessions in parallel for better performance
-    std::vector<asio::awaitable<void>> notify_tasks;
-    notify_tasks.reserve(sessions_copy.size());
-
+    // Notify all sessions sequentially
     for (auto& session : sessions_copy) {
-      notify_tasks.emplace_back([this, session, &func_name, &buffer]() -> asio::awaitable<void> {
-        try {
-          co_await session->notify(func_name, buffer);
-        } catch (const std::exception& e) {
-          // Log warning asynchronously without blocking
-          log_warning_async(std::string("Failed to notify session: ") + e.what());
-          // Remove failed session using strand
-          asio::post(*sessions_strand_, [this, session]() {
-            active_sessions_.erase(session);
-          });
-        } catch (...) {
-          // Log warning asynchronously without blocking
-          log_warning_async("Unknown error notifying session");
-          // Remove failed session using strand
-          asio::post(*sessions_strand_, [this, session]() {
-            active_sessions_.erase(session);
-          });
-        }
-      }());
-    }
-
-    // Wait for all notifications to complete
-    for (auto& task : notify_tasks) {
-      co_await std::move(task);
+      try {
+        co_await session->notify(func_name, buffer);
+      } catch (const std::exception& e) {
+        // Log warning asynchronously without blocking
+        log_warning_async(std::string("Failed to notify session: ") + e.what());
+        // Remove failed session using strand
+        asio::post(*sessions_strand_, [this, session]() {
+          active_sessions_.erase(session);
+        });
+      } catch (...) {
+        // Log warning asynchronously without blocking
+        log_warning_async("Unknown error notifying session");
+        // Remove failed session using strand
+        asio::post(*sessions_strand_, [this, session]() {
+          active_sessions_.erase(session);
+        });
+      }
     }
 
     co_return;

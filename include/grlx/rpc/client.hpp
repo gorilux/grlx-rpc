@@ -37,7 +37,7 @@ public:
   template <typename... ArgsT>
   client(ArgsT&&... args)
     : channel_(std::forward<ArgsT>(args)...)
-    , buffer_pool_(32, 1024, 4096) {
+    , buffer_pool_(std::make_unique<buffer_pool>(32, 1024, 4096)) {
   }
 
   client(client&& other)
@@ -64,8 +64,13 @@ public:
 
     asio::co_spawn(executor, client_session_->dispatch_requests(), [](std::exception_ptr error) {
       if (error) {
-        spdlog::error("rpc::client::dispatch_requests error:");
-        std::rethrow_exception(error);
+        try {
+          std::rethrow_exception(error);
+        } catch (std::exception const& e) {
+          spdlog::error("rpc::client::dispatch_requests error: {}", e.what());
+        } catch (...) {
+          spdlog::error("rpc::client::dispatch_requests unknown error");
+        }
       }
     });
 
@@ -80,7 +85,7 @@ public:
     }
 
     // Fix: Use buffer pool correctly - the session.call() needs a const reference, not moved buffer
-    auto  req_buffer_guard = buffer_pool_.get_buffer();
+    auto  req_buffer_guard = buffer_pool_->get_buffer();
     auto& req_buffer       = *req_buffer_guard;
 
     message_request<typename std::decay<ArgsT>::type...> request{std::make_tuple(std::forward<ArgsT>(args)...)};
@@ -230,8 +235,8 @@ public:
   performance_stats get_performance_stats() const {
     performance_stats stats;
     stats.total_calls        = total_calls_;
-    stats.buffer_pool_hits   = buffer_pool_.hit_count();
-    stats.buffer_pool_misses = buffer_pool_.miss_count();
+    stats.buffer_pool_hits   = buffer_pool_->hit_count();
+    stats.buffer_pool_misses = buffer_pool_->miss_count();
     stats.hash_cache_hits    = hash_cache_hits_;
     stats.hash_cache_misses  = hash_cache_misses_;
     return stats;
@@ -284,7 +289,7 @@ private:
   ChannelT                      channel_;
   std::shared_ptr<session_type> client_session_;
 
-  mutable buffer_pool buffer_pool_;
+  std::unique_ptr<buffer_pool> buffer_pool_;
 
   std::unordered_map<std::string, std::uint64_t>               function_hash_cache_;
   std::unordered_map<std::uint64_t, notification_handler_type> notification_handlers_;
