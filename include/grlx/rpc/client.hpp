@@ -57,12 +57,22 @@ public:
     auto executor = co_await asio::this_coro::executor;
 
     client_session_ = co_await channel_.connect(endpoint);
+
+    if (!client_session_ || !client_session_->next_layer().is_open()) {
+      client_session_.reset();
+      throw std::runtime_error("rpc::client::connect: invalid session after connect");
+    }
+
     co_await client_session_->handshake();
 
     // Set up notification handling in the session
     setup_notification_handling();
 
-    asio::co_spawn(executor, client_session_->dispatch_requests(), [](std::exception_ptr error) {
+    // Use the socket's own executor to ensure reactor affinity (the socket is registered
+    // with the io_context reactor it was created on; dispatching on a different executor
+    // would cause a null reactor_data crash on platforms like Android).
+    auto socket_executor = client_session_->next_layer().get_executor();
+    asio::co_spawn(socket_executor, client_session_->dispatch_requests(), [](std::exception_ptr error) {
       if (error) {
         try {
           std::rethrow_exception(error);
@@ -169,6 +179,8 @@ public:
 
     auto hash_value                    = shash64(notification_name).value();
     notification_handlers_[hash_value] = std::move(wrapper);
+    spdlog::info("RPC: registered notification handler '{}' hash=0x{:X} (total={})",
+                  notification_name, hash_value, notification_handlers_.size());
   }
 
   // Automatic type deduction for lambdas and function objects (like server's attach!)
@@ -275,13 +287,13 @@ private:
       try {
         it->second(buffer);
       } catch (const std::exception& e) {
-        // Log error or handle notification processing error
-        // For now, we'll silently ignore errors in notification handling
         spdlog::error("Error in notification handling: {}", e.what());
       } catch (...) {
-        // Ignore unknown errors in notification handling
         spdlog::error("Unknown error in notification handling");
       }
+    } else {
+      spdlog::warn("RPC: unhandled notification call_id=0x{:X}, buffer={} bytes, registered_handlers={}",
+                    call_id, buffer.size(), notification_handlers_.size());
     }
   }
 

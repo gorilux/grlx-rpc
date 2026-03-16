@@ -45,6 +45,14 @@ public:
   using response_channel           = asio::experimental::concurrent_channel<void(boost::system::error_code, buffer_type)>;
   using notification_callback_type = std::function<void(std::uint64_t, buffer_type const&)>;
 
+  // Write serialization: all outgoing data is queued through this channel
+  // and written by a single msg_writer coroutine, preventing interleaved async_writes.
+  struct write_item {
+    header_type header;
+    buffer_type body;
+  };
+  using write_channel_type = asio::experimental::concurrent_channel<void(boost::system::error_code, write_item)>;
+
   // Header layout
   static inline const std::uint64_t MAGIC_HEADER_NUMBER = 0xBADC0FFEE;
   static inline const int           MAGIC_HEADER_IDX    = 0;
@@ -70,8 +78,8 @@ public:
     , dispatcher_(disp)
     , logger_(std::make_shared<async_logger>(stream_.get_executor()))
     , strand_(asio::make_strand(stream_.get_executor()))
-    , async_manager_(strand_) {
-    // Start the logger worker after construction
+    , async_manager_(strand_)
+    , write_channel_(stream_.get_executor(), 256) {
     logger_->start();
   }
 
@@ -79,7 +87,8 @@ public:
     : stream_(std::move(other.stream_))
     , dispatcher_(std::move(other.dispatcher_))
     , logger_(std::move(other.logger_))
-    , strand_(std::move(other.strand_)) {
+    , strand_(std::move(other.strand_))
+    , write_channel_(std::move(other.write_channel_)) {
   }
 
   virtual ~session() {
@@ -101,7 +110,7 @@ public:
     // Register the channel and get a token
     auto async_op = async_manager_.create_operation();
 
-    // Build and send request
+    // Build and queue request
     header_type req_header;
     req_header[MAGIC_HEADER_IDX] = MAGIC_HEADER_NUMBER;
     req_header[MSG_SIZE_IDX]     = req_buffer.size();
@@ -109,18 +118,7 @@ public:
     req_header[CALL_ID_IDX]      = call_id.value();
     req_header[USER_TOKEN_IDX]   = async_op.token;
 
-    std::array<boost::asio::const_buffer, 2> buffers = {asio::buffer(req_header.data(), req_header.size() * sizeof(header_type::value_type)),
-                                                        asio::buffer(req_buffer)};
-
-    // spdlog::debug("Write {}: 0x{:X} {} 0x{:X} {} {}",
-    //               __FUNCTION__,
-    //               req_header[MAGIC_HEADER_IDX],
-    //               msg_type_to_string(to_msg_type(req_header[MSG_TYPE_IDX])),
-    //               req_header[CALL_ID_IDX],
-    //               req_header[USER_TOKEN_IDX],
-    //               req_header[MSG_SIZE_IDX]);
-
-    co_await asio::async_write(stream_, buffers, asio::transfer_all(), asio::use_awaitable);
+    co_await queue_write(std::move(req_header), buffer_type(req_buffer));
 
     // Wait for response with timeout (using built-in timeout support)
     auto [ec, buffer] = co_await async_op.async_wait(timeout, asio::as_tuple(asio::use_awaitable));
@@ -136,7 +134,12 @@ public:
   }
 
   auto dispatch_requests() -> asio::awaitable<void> {
-    co_await msg_reader();
+    if (!stream_.is_open()) {
+      spdlog::error("rpc::session::dispatch_requests: socket is not open, aborting");
+      co_return;
+    }
+    using namespace asio::experimental::awaitable_operators;
+    co_await (msg_reader() && msg_writer());
     co_return;
   }
 
@@ -150,18 +153,21 @@ public:
     notification_header[USER_TOKEN_IDX]   = 0;
     notification_header[MSG_TYPE_IDX]     = (static_cast<std::uint64_t>(msg_type::notification) << 32);
 
-    std::array<boost::asio::const_buffer, 2> buffers = {
-        asio::buffer(notification_header.data(), notification_header.size() * sizeof(header_type::value_type)),
-        asio::buffer(buffer)};
+    co_await queue_write(std::move(notification_header), buffer_type(buffer));
+  }
 
-    // spdlog::debug("Write {}: 0x{:X} {} 0x{:X} {} {}",
-    //               __FUNCTION__,
-    //               notification_header[MAGIC_HEADER_IDX],
-    //               msg_type_to_string(to_msg_type(notification_header[MSG_TYPE_IDX])),
-    //               notification_header[CALL_ID_IDX],
-    //               notification_header[USER_TOKEN_IDX],
-    //               notification_header[MSG_SIZE_IDX]);
-    co_await asio::async_write(stream_, buffers, asio::use_awaitable);
+  // Non-blocking notify: returns false if the write channel is full (client too slow)
+  bool try_notify(std::string const& call_name, buffer_type const& buffer) {
+    auto call_id = shash64(call_name);
+
+    header_type notification_header;
+    notification_header[MAGIC_HEADER_IDX] = MAGIC_HEADER_NUMBER;
+    notification_header[MSG_SIZE_IDX]     = buffer.size();
+    notification_header[CALL_ID_IDX]      = call_id.value();
+    notification_header[USER_TOKEN_IDX]   = 0;
+    notification_header[MSG_TYPE_IDX]     = (static_cast<std::uint64_t>(msg_type::notification) << 32);
+
+    return write_channel_.try_send(boost::system::error_code{}, write_item{std::move(notification_header), buffer_type(buffer)});
   }
 
   next_layer_type& next_layer() {
@@ -177,6 +183,9 @@ public:
     if (!is_closed_.compare_exchange_strong(expected, true)) {
       return; // Already closed
     }
+
+    // Close write channel so msg_writer exits
+    write_channel_.close();
 
     // Cancel all pending operations before closing the stream
     try {
@@ -196,6 +205,35 @@ public:
   }
 
 private:
+  // Queue a write item for the msg_writer coroutine to send
+  auto queue_write(header_type header, buffer_type body) -> asio::awaitable<void> {
+    co_await write_channel_.async_send(boost::system::error_code{}, write_item{std::move(header), std::move(body)}, asio::use_awaitable);
+  }
+
+  // Dedicated writer coroutine — serializes all outgoing writes on the socket
+  asio::awaitable<void> msg_writer() {
+    try {
+      for (;;) {
+        auto [ec, item] = co_await write_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+        if (ec)
+          break;
+
+        std::array<asio::const_buffer, 2> buffers = {asio::buffer(item.header.data(), item.header.size() * sizeof(header_type::value_type)),
+                                                     asio::buffer(item.body)};
+
+        co_await asio::async_write(stream_, buffers, asio::use_awaitable);
+      }
+    } catch (boost::system::system_error const& e) {
+      if (e.code() != asio::error::eof && e.code() != asio::error::connection_reset && e.code() != asio::error::broken_pipe &&
+          e.code() != asio::error::operation_aborted) {
+        log_error_async("Write error: " + e.code().message());
+      }
+    } catch (...) {
+      log_error_async("Unknown write error");
+    }
+    close();
+  }
+
   asio::awaitable<void> msg_reader() {
     try {
       for (;;) {
@@ -266,20 +304,7 @@ private:
     rsp_header[USER_TOKEN_IDX]   = related_msg[USER_TOKEN_IDX];
     rsp_header[MSG_SIZE_IDX]     = rsp_buffer.size();
 
-    std::array<boost::asio::const_buffer, 2> buffers = {asio::buffer(rsp_header.data(), rsp_header.size() * sizeof(header_type::value_type)),
-                                                        asio::buffer(rsp_buffer)};
-
-    co_await asio::async_write(stream_, buffers, asio::transfer_all(), asio::use_awaitable);
-
-    // spdlog::debug("Write {}: 0x{:X} {} 0x{:X} {} {}",
-    //               __FUNCTION__,
-    //               rsp_header[MAGIC_HEADER_IDX],
-    //               msg_type_to_string(msgtype),
-    //               rsp_header[CALL_ID_IDX],
-    //               rsp_header[USER_TOKEN_IDX],
-    //               rsp_header[MSG_SIZE_IDX]);
-
-    co_return;
+    co_await queue_write(std::move(rsp_header), buffer_type(rsp_buffer));
   }
 
   asio::awaitable<void> dispatch_request(header_type const& req_header) {
@@ -456,6 +481,7 @@ private:
   std::shared_ptr<async_logger>    logger_;
   asio::strand<executor_type>      strand_;
   async_manager_type               async_manager_;
+  write_channel_type               write_channel_;
   notification_callback_type       notification_callback_;
   std::atomic<bool>                is_closed_{false};
 };

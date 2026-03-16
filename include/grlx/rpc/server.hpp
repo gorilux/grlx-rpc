@@ -167,24 +167,14 @@ public:
         },
         asio::use_awaitable);
 
-    // Notify all sessions sequentially
+    // Notify all sessions non-blocking — drop notifications for slow clients
     for (auto& session : sessions_copy) {
-      try {
-        co_await session->notify(func_name, buffer);
-      } catch (const std::exception& e) {
-        // Log warning asynchronously without blocking
-        log_warning_async(std::string("Failed to notify session: ") + e.what());
-        // Remove failed session using strand
+      if (!session->try_notify(func_name, buffer)) {
+        log_warning_async("Session write channel full, disconnecting slow client");
         asio::post(*sessions_strand_, [this, session]() {
           active_sessions_.erase(session);
         });
-      } catch (...) {
-        // Log warning asynchronously without blocking
-        log_warning_async("Unknown error notifying session");
-        // Remove failed session using strand
-        asio::post(*sessions_strand_, [this, session]() {
-          active_sessions_.erase(session);
-        });
+        session->close();
       }
     }
 
