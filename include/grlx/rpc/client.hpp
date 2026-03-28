@@ -72,7 +72,7 @@ public:
     // with the io_context reactor it was created on; dispatching on a different executor
     // would cause a null reactor_data crash on platforms like Android).
     auto socket_executor = client_session_->next_layer().get_executor();
-    asio::co_spawn(socket_executor, client_session_->dispatch_requests(), [](std::exception_ptr error) {
+    asio::co_spawn(socket_executor, client_session_->dispatch_requests(), [this](std::exception_ptr error) {
       if (error) {
         try {
           std::rethrow_exception(error);
@@ -82,6 +82,9 @@ public:
           spdlog::error("rpc::client::dispatch_requests unknown error");
         }
       }
+      // Session is dead — clear it so is_connected() returns false
+      // and the health-check system can trigger reconnection.
+      client_session_.reset();
     });
 
     co_return;
