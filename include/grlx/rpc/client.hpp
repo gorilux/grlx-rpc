@@ -58,7 +58,9 @@ public:
 
     client_session_ = co_await channel_.connect(endpoint);
 
-    if (!client_session_ || !client_session_->next_layer().is_open()) {
+    // Descend to the TCP socket via lowest_layer() so the check works for both
+    // plain tcp_channel and ssl_channel (where next_layer() is ssl::stream).
+    if (!client_session_ || !client_session_->next_layer().lowest_layer().is_open()) {
       client_session_.reset();
       throw std::runtime_error("rpc::client::connect: invalid session after connect");
     }
@@ -220,6 +222,14 @@ public:
 
   bool is_connected() const noexcept {
     return client_session_ != nullptr;
+  }
+
+  // Non-blocking keepalive. Returns false if no session or the write channel
+  // is full. Apps with long idle periods (watching a video stream but not
+  // issuing RPCs) should call this periodically to avoid the server's
+  // idle_timeout closing the connection.
+  bool try_ping() {
+    return client_session_ && client_session_->try_ping();
   }
 
   void disconnect() {

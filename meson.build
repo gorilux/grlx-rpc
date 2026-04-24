@@ -69,7 +69,19 @@ set_variable('grlx_rpc_dep', grlx_rpc_dep)
 # Unit Tests
 # ==========
 
-if not meson.is_subproject() and system != 'emscripten' and system != 'android'
+# Tests are gated on three conditions:
+#   1. the 'tests' feature option is not disabled
+#   2. the target platform can run native test binaries (not emscripten / android)
+#   3. either we are building standalone, OR the parent project explicitly enabled tests
+#      via `-Dgrlx-rpc:tests=enabled`
+tests_opt = get_option('tests')
+native_target = system != 'emscripten' and system != 'android'
+build_tests = tests_opt.enabled() or (tests_opt.auto() and not meson.is_subproject() and native_target)
+if tests_opt.enabled() and not native_target
+  error('grlx-rpc tests cannot run on @0@ — disable the tests option for this target'.format(system))
+endif
+
+if build_tests
   subdir('test')
 endif
 

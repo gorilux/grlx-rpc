@@ -1,28 +1,65 @@
 # Test configuration for grlx-rpc
+#
+# Each topic-scoped test file builds as its own binary and is registered as
+# its own test() target, so one failure doesn't mask another.
 
-gtest_dep = dependency('gtest', required: false)
+gtest_dep      = dependency('gtest', fallback: ['gtest', 'gtest_dep'])
+gtest_main_dep = dependency('gtest_main', fallback: ['gtest', 'gtest_main_dep'])
 
-if gtest_dep.found()
-  test_sources = [
-    'test_rpc.cpp',
-  ]
+# cereal is header-only and needed by grlx-rpc's encoder. Fall back to the
+# parent project's cereal subproject when grlx-rpc is built as a subproject.
+cereal_dep = dependency('cereal', fallback: ['cereal', 'cereal_dep'])
 
-  test_executable = executable(
-    'test_rpc',
-    sources: test_sources,
-    dependencies: [
-      grlx_rpc_dep,
-      gtest_dep,
-      dependency('gtest_main'),
-    ],
-    include_directories: [
-      include_directories('../include'),
-    ],
-  )
+# OpenSSL is needed for TLS tests and for generating test certs in-process.
+openssl_dep = dependency('openssl')
 
-  test('grlx-rpc unit tests', test_executable)
+test_common_deps = [
+  grlx_rpc_dep,
+  cereal_dep,
+  gtest_dep,
+  gtest_main_dep,
+  # rpc_fixture.hpp includes ssl_channel.hpp, which pulls in boost::asio::ssl
+  # symbols transitively — every test binary needs libcrypto linked even if
+  # it only runs over plain TCP.
+  openssl_dep,
+]
+
+# grlx_headers_dep is appended below once computed.
+
+test_common_inc = [
+  include_directories('../include'),
+  include_directories('.'),
+]
+
+# session.hpp pulls in <grlx/tmpl/string_hash.hpp> from the separate grlx
+# header-only library. Add its include path without linking the whole library.
+grlx_headers_path = meson.global_source_root() / 'subprojects' / 'grlx' / 'include'
+if not import('fs').exists(grlx_headers_path)
+  # Standalone builds won't have the sibling grlx subproject; fall back to
+  # the local rpc/string_hash.hpp via a small shim header in tests.
+  grlx_headers_dep = declare_dependency()
 else
-  message('Google Test not found, skipping tests')
+  grlx_headers_dep = declare_dependency(
+    compile_args: ['-isystem', grlx_headers_path],
+  )
 endif
 
+test_files = {
+  'test_rpc':        {'sources': ['test_rpc.cpp']},
+  'test_session':    {'sources': ['test_session.cpp']},
+  'test_server':     {'sources': ['test_server.cpp']},
+  'test_dispatcher': {'sources': ['test_dispatcher.cpp']},
+  'test_ssl':        {'sources': ['test_ssl.cpp']},
+  'test_security':   {'sources': ['test_security.cpp']},
+}
 
+foreach name, spec : test_files
+  extra_deps = spec.get('extra_deps', [])
+  exe = executable(
+    name,
+    sources: spec['sources'],
+    dependencies: test_common_deps + [grlx_headers_dep] + extra_deps,
+    include_directories: test_common_inc,
+  )
+  test('grlx-rpc ' + name, exe, suite: 'grlx-rpc', timeout: 30)
+endforeach

@@ -1,111 +1,75 @@
+// Baseline TCP-channel regression tests.
+//
+// These exercise the happy paths of the RPC stack over a plain tcp_channel so
+// that subsequent hardening work can refer back to them. Each test drives a
+// single io_context via the rpc_fixture helper; servers bind to ephemeral
+// ports so tests can run in parallel.
 
-#include <grlx/rpc/client.hpp>
-#include <grlx/rpc/encoder.hpp>
-#include <grlx/rpc/server.hpp>
-#include <grlx/rpc/tcp_channel.hpp>
+#include "fixtures/rpc_fixture.hpp"
 
-#include <boost/asio.hpp>
-
-#include <format>
 #include <gtest/gtest.h>
+
 #include <string>
 #include <tuple>
 
 namespace asio = boost::asio;
-using boost::asio::ip::tcp;
+using grlx::rpc::testing::rpc_fixture;
+using grlx::rpc::testing::tcp_ch;
 
-class grlx_rpc_test : public ::testing::Test {
-public:
-  void SetUp() override {
-    work_guard = asio::make_work_guard(io_context);
-  }
+class rpc_tcp_test : public rpc_fixture {};
 
-  void TearDown() override {
-    work_guard.reset();
-    io_context.stop();
-  }
+TEST_F(rpc_tcp_test, roundtrip_returns_tuple) {
+  run([this]() -> asio::awaitable<void> {
+    grlx::rpc::server<tcp_ch> server;
+    auto address = co_await start_tcp_server(server, [](auto& s) {
+      s.attach("echo", [](int a, double b, std::string const& c) -> std::tuple<int, double, std::string> {
+        return {a, b, c};
+      });
+    });
 
-  std::tuple<int, double, std::string> my_func(int first, double second, std::string const& third) {
-    return std::make_tuple(first, second, third);
-  }
+    grlx::rpc::client<tcp_ch> client;
+    co_await client.connect(address);
+    auto r = co_await client.invoke<std::tuple<int, double, std::string>>(
+        "echo", 10, 20.0, std::string("hello"));
 
-  asio::awaitable<int> async_func() {
-    co_return 42;
-  }
-
-  asio::io_context                                           io_context;
-  asio::executor_work_guard<asio::io_context::executor_type> work_guard{io_context.get_executor()};
-};
-
-TEST_F(grlx_rpc_test, test_tcp_channel) {
-
-  using channel_type  = grlx::rpc::tcp_channel<grlx::rpc::binary_encoder>;
-  using rpc_client    = grlx::rpc::client<channel_type>;
-  using rpc_server    = grlx::rpc::server<channel_type>;
-  grlx_rpc_test* self = this;
-
-  asio::co_spawn(
-      io_context,
-      [&, this]() -> asio::awaitable<void> {
-        auto       exec = co_await asio::this_coro::executor;
-        rpc_server server;
-        server.attach("my_func", self, &grlx_rpc_test::my_func);
-        co_await server.start(tcp::endpoint(boost::asio::ip::tcp::v4(), 0));
-
-        rpc_client  client;
-        std::string address = std::format("127.0.0.1:{}", server.channel->endpoint().port());
-        co_await client.connect(address);
-
-        auto response = co_await client.invoke<std::tuple<int, double, std::string>>("my_func", 10, 20.0, std::string("300.0"));
-
-        EXPECT_EQ(std::get<0>(response), 10);
-        EXPECT_EQ(std::get<1>(response), 20.0);
-        EXPECT_EQ(std::get<2>(response), "300.0");
-        io_context.stop();
-        co_return;
-      },
-      asio::detached);
-  io_context.run();
+    EXPECT_EQ(std::get<0>(r), 10);
+    EXPECT_DOUBLE_EQ(std::get<1>(r), 20.0);
+    EXPECT_EQ(std::get<2>(r), "hello");
+  });
 }
 
-TEST_F(grlx_rpc_test, test_coroutine_support) {
+TEST_F(rpc_tcp_test, coroutine_handler_member_and_lambda) {
+  run([this]() -> asio::awaitable<void> {
+    grlx::rpc::server<tcp_ch> server;
+    auto address = co_await start_tcp_server(server, [](auto& s) {
+      s.attach("answer", []() -> asio::awaitable<int> { co_return 42; });
+      s.attach("add", [](int a, int b) -> asio::awaitable<int> { co_return a + b; });
+    });
 
-  using channel_type  = grlx::rpc::tcp_channel<grlx::rpc::binary_encoder>;
-  using rpc_client    = grlx::rpc::client<channel_type>;
-  using rpc_server    = grlx::rpc::server<channel_type>;
-  grlx_rpc_test* self = this;
+    grlx::rpc::client<tcp_ch> client;
+    co_await client.connect(address);
 
-  asio::co_spawn(
-      io_context,
-      [&, this]() -> asio::awaitable<void> {
-        auto       exec = co_await asio::this_coro::executor;
-        rpc_server server;
+    EXPECT_EQ(co_await client.invoke<int>("answer"), 42);
+    EXPECT_EQ(co_await client.invoke<int>("add", 2, 3), 5);
+  });
+}
 
-        // Test member function coroutine
-        server.attach("async_func", self, &grlx_rpc_test::async_func);
+TEST_F(rpc_tcp_test, large_payload_roundtrip_256KiB) {
+  // Locks in that legitimately-large messages work today. When Phase 1 adds a
+  // message-size cap, the cap must be ≥ this size or this test must be updated
+  // deliberately.
+  run([this]() -> asio::awaitable<void> {
+    grlx::rpc::server<tcp_ch> server;
+    auto address = co_await start_tcp_server(server, [](auto& s) {
+      s.attach("echo_bytes", [](std::string const& payload) -> std::string { return payload; });
+    });
 
-        // Test lambda coroutine
-        server.attach("MyFunc", []() -> asio::awaitable<int> {
-          co_return 1;
-        });
+    grlx::rpc::client<tcp_ch> client;
+    co_await client.connect(address);
 
-        co_await server.start(tcp::endpoint(boost::asio::ip::tcp::v4(), 0));
-
-        rpc_client  client;
-        std::string address = std::format("127.0.0.1:{}", server.channel->endpoint().port());
-        co_await client.connect(address);
-
-        // Test member function coroutine
-        auto response1 = co_await client.invoke<int>("async_func");
-        EXPECT_EQ(response1, 42);
-
-        // Test lambda coroutine
-        auto response2 = co_await client.invoke<int>("MyFunc");
-        EXPECT_EQ(response2, 1);
-
-        io_context.stop();
-        co_return;
-      },
-      asio::detached);
-  io_context.run();
+    std::string payload(256 * 1024, 'x');
+    auto        response = co_await client.invoke<std::string>("echo_bytes", payload);
+    EXPECT_EQ(response.size(), payload.size());
+    EXPECT_EQ(response, payload);
+  });
 }

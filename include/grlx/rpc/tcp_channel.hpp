@@ -4,6 +4,8 @@
 
 #include <boost/asio/awaitable.hpp>
 
+#include <functional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -11,6 +13,19 @@ namespace grlx::rpc {
 
 namespace asio = boost::asio;
 using tcp      = asio::ip::tcp;
+
+// Thrown when the pre-session filter rejects a freshly accepted TCP peer.
+// The server's accept loop catches and continues.
+class tcp_connection_rejected_error : public std::runtime_error {
+public:
+  explicit tcp_connection_rejected_error(std::string reason)
+    : std::runtime_error("connection rejected: " + reason) {}
+};
+
+// Predicate that inspects a freshly accepted peer endpoint and decides
+// whether to proceed. Return false to reject the connection.
+using tcp_pre_session_filter = std::function<bool(tcp::endpoint const& peer,
+                                                  std::string&        reject_reason)>;
 
 namespace detail {
 // Simple host:port parser to avoid URL library dependency
@@ -85,10 +100,31 @@ public:
     return tcp::endpoint();
   }
 
+  void set_pre_handshake_filter(tcp_pre_session_filter f) {
+    pre_filter_ = std::move(f);
+  }
+
   template <typename... ArgsT>
   auto accept(ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
     auto tcp_socket = co_await acceptor_->async_accept(asio::use_awaitable);
-    co_return std::make_shared<session_type>(std::move(tcp_socket), std::forward<ArgsT>(args)...);
+
+    boost::system::error_code ep_ec;
+    auto                      peer = tcp_socket.remote_endpoint(ep_ec);
+    if (pre_filter_ && !ep_ec) {
+      std::string reason;
+      if (!pre_filter_(peer, reason)) {
+        boost::system::error_code ignored;
+        tcp_socket.close(ignored);
+        throw tcp_connection_rejected_error(reason.empty() ? "filter denied" : reason);
+      }
+    }
+
+    auto sess = std::make_shared<session_type>(std::move(tcp_socket), std::forward<ArgsT>(args)...);
+    if (!ep_ec) {
+      sess->set_peer_ip(peer.address().to_string());
+      sess->set_peer_address(peer.address().to_string() + ":" + std::to_string(peer.port()));
+    }
+    co_return sess;
   }
 
   auto connect(std::string const& address) -> asio::awaitable<std::shared_ptr<session_type>> {
@@ -111,6 +147,7 @@ public:
 
 private:
   std::unique_ptr<tcp::acceptor> acceptor_;
+  tcp_pre_session_filter         pre_filter_;
 };
 
 } // namespace grlx::rpc

@@ -2,6 +2,7 @@
 
 #include "async_logger.hpp"
 #include "dispatcher.hpp"
+#include "security.hpp"
 #include "session.hpp"
 
 #include <boost/asio/awaitable.hpp>
@@ -9,7 +10,10 @@
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/strand.hpp>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace grlx::rpc {
@@ -61,6 +65,42 @@ public:
       sessions_strand_ = std::make_unique<asio::strand<typename ChannelT::executor_type>>(asio::make_strand(channel_.get_executor()));
     }
 
+    // Install the connection-cap + rate-limit filter on the channel. Runs
+    // pre-handshake so rejected peers never pay for (or force us to pay
+    // for) a TLS handshake. Three checks in order:
+    //   1. global session cap (cheap atomic)
+    //   2. per-IP session cap (locked map)
+    //   3. per-IP accept token bucket (same locked map)
+    // Only step 3 consumes state; (1) and (2) are read-only probes.
+    channel_.set_pre_handshake_filter(
+        [this](auto const& peer, std::string& reason) -> bool {
+          if (global_session_count_.load(std::memory_order_acquire) >= limits_.max_concurrent_sessions) {
+            reason = "global session cap reached";
+            return false;
+          }
+          std::string                 ip = peer.address().to_string();
+          std::lock_guard<std::mutex> lock(per_ip_mutex_);
+
+          auto it = per_ip_count_.find(ip);
+          if (it != per_ip_count_.end() && it->second >= limits_.max_sessions_per_ip) {
+            reason = "per-IP session cap reached for " + ip;
+            return false;
+          }
+
+          // Bucket is created on first sight of this IP and initialized
+          // with the server's current rate config.
+          auto& bucket = per_ip_accept_bucket_[ip];
+          if (bucket.capacity == 0.0) {
+            bucket.capacity       = limits_.accept_burst_per_ip;
+            bucket.refill_per_sec = limits_.accept_refill_per_ip_per_s;
+          }
+          if (!bucket.try_take()) {
+            reason = "per-IP accept rate exceeded for " + ip;
+            return false;
+          }
+          return true;
+        });
+
     // if (!logger_) {
     //   logger_ = std::make_shared<async_logger>(executor);
     //   logger_->start();
@@ -73,17 +113,57 @@ public:
 
           for (;;) {
             try {
-              auto session = co_await channel_.accept(dispatcher_);
+              auto session = co_await channel_.accept(dispatcher_, session_limits_);
+
+              // Admit the session: bump the global + per-IP counters that
+              // back the pre-handshake filter. Order matters — we increment
+              // BEFORE adding to active_sessions_, so a concurrent accept
+              // sees the new count and can reject flooders before adding
+              // more load. Matching decrement happens on session close.
+              global_session_count_.fetch_add(1, std::memory_order_acq_rel);
+              {
+                std::lock_guard<std::mutex> lock(per_ip_mutex_);
+                ++per_ip_count_[session->peer_ip()];
+              }
 
               // Add session using strand - guarantees serialized access
               asio::post(*sessions_strand_, [this, session]() {
                 active_sessions_.insert(session);
               });
 
+              // Fire the application-visible "session opened" hook with the
+              // peer identity captured during the TLS handshake. This is
+              // where auth layers learn the cert fingerprint to bind tokens
+              // to, and where operators wire up connection logging.
+              if (on_session_open_) {
+                try {
+                  on_session_open_(session_info{
+                      .peer_fingerprint = session->peer_fingerprint(),
+                      .peer_address     = session->peer_address(),
+                  });
+                } catch (...) {
+                  // A buggy hook must not kill the accept loop.
+                  log_error_async("session_open hook threw");
+                }
+              }
+
               // Create individual strand for each session
               auto session_strand = asio::make_strand(executor);
 
               asio::co_spawn(session_strand, session->dispatch_requests(), [session, this](std::exception_ptr error) {
+                // Release the seat we took in the global + per-IP counters
+                // so a future connect from this IP isn't wrongly rejected.
+                global_session_count_.fetch_sub(1, std::memory_order_acq_rel);
+                {
+                  std::lock_guard<std::mutex> lock(per_ip_mutex_);
+                  auto it = per_ip_count_.find(session->peer_ip());
+                  if (it != per_ip_count_.end()) {
+                    if (--it->second == 0) {
+                      per_ip_count_.erase(it);
+                    }
+                  }
+                }
+
                 // Remove session using strand - guarantees serialized access
                 asio::post(*sessions_strand_, [this, session]() {
                   active_sessions_.erase(session);
@@ -144,6 +224,50 @@ public:
   template <typename F>
   void attach(std::string const& func_name, F&& func) {
     dispatcher_->attach(func_name, std::function{func});
+  }
+
+  // visibility-aware overloads. Mark a handler public_ to skip the auth
+  // callback, admin to require both allow AND is_admin from the callback.
+  template <typename F>
+  void attach(std::string const& func_name, visibility vis, F&& func) {
+    dispatcher_->attach(func_name, vis, std::function{func});
+  }
+
+  template <typename R, typename C, typename... ArgsT>
+  void attach(std::string const& func_name, visibility vis, C* objPtr, R (C::*memFunc)(ArgsT...) const) {
+    if (!objPtr) throw std::invalid_argument("Object pointer cannot be null");
+    std::function<R(ArgsT...)> call = [objPtr, memFunc](ArgsT&&... args) -> R {
+      return (objPtr->*memFunc)(std::forward<ArgsT>(args)...);
+    };
+    dispatcher_->attach(func_name, vis, std::move(call));
+  }
+
+  template <typename R, typename C, typename... ArgsT>
+  void attach(std::string const& func_name, visibility vis, C* objPtr, R (C::*memFunc)(ArgsT...)) {
+    if (!objPtr) throw std::invalid_argument("Object pointer cannot be null");
+    std::function<R(ArgsT...)> call = [objPtr, memFunc](ArgsT&&... args) -> R {
+      return (objPtr->*memFunc)(std::forward<ArgsT>(args)...);
+    };
+    dispatcher_->attach(func_name, vis, std::move(call));
+  }
+
+  // Install the pre-dispatch auth callback. Called for every non-public
+  // method before its handler runs. Must be installed *before* clients start
+  // calling authenticated endpoints, or those calls will be denied.
+  void set_auth_callback(auth_callback cb) {
+    dispatcher_->set_auth_callback(std::move(cb));
+  }
+
+  // Connection limits applied before the TLS handshake. Set these before
+  // start(), or (safely) while running — changes take effect on the next
+  // accept. The safe-by-default values live in server_limits; only override
+  // if you have a reason and have thought about DoS consequences.
+  void set_server_limits(server_limits limits) {
+    limits_ = limits;
+  }
+
+  server_limits const& get_server_limits() const noexcept {
+    return limits_;
   }
 
   template <typename... ArgsT>
@@ -230,6 +354,27 @@ public:
     return channel_;
   }
 
+  // Configure the per-session security limits applied to every newly accepted
+  // connection. Must be called before start() to take effect for the first
+  // clients; changes after start() affect only subsequently accepted sessions.
+  void set_session_limits(session_limits limits) {
+    session_limits_ = limits;
+  }
+
+  session_limits const& get_session_limits() const {
+    return session_limits_;
+  }
+
+  // Fires once per accepted session, right after the TLS handshake has
+  // completed and the session has been registered. The callback receives
+  // peer identity (cert fingerprint, remote address) captured during the
+  // handshake and should be fast and non-throwing. Use it for per-session
+  // auth setup, structured connection logs, or metrics.
+  using session_open_callback = std::function<void(session_info const&)>;
+  void on_session_open(session_open_callback cb) {
+    on_session_open_ = std::move(cb);
+  }
+
 private:
   // Helper methods for non-blocking logging
   void log_error_async(const std::string& message) {
@@ -262,6 +407,13 @@ private:
   std::unordered_set<std::shared_ptr<session_type>>               active_sessions_;
   std::unique_ptr<asio::strand<typename ChannelT::executor_type>> sessions_strand_; // Strand for session management - initialized in start()
   std::shared_ptr<async_logger>                                   logger_;
+  session_limits                                                  session_limits_{};
+  session_open_callback                                           on_session_open_;
+  server_limits                                                   limits_{};
+  std::atomic<std::size_t>                                        global_session_count_{0};
+  std::mutex                                                      per_ip_mutex_;
+  std::unordered_map<std::string, std::size_t>                    per_ip_count_;
+  std::unordered_map<std::string, token_bucket>                   per_ip_accept_bucket_;
 };
 
 } // namespace grlx::rpc

@@ -3,11 +3,14 @@
 #include "async_logger.hpp"
 #include "async_manager.hpp"
 #include "dispatcher.hpp"
+#include "security.hpp"
 
 #include <grlx/tmpl/string_hash.hpp>
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -70,17 +73,26 @@ public:
   };
 
   session(AsyncStreamT&& stream)
-    : session(std::move(stream), std::make_shared<dispatcher_type>()) {
+    : session(std::move(stream), std::make_shared<dispatcher_type>(), session_limits{}) {
   }
 
   session(AsyncStreamT&& stream, std::shared_ptr<dispatcher_type> const& disp)
+    : session(std::move(stream), disp, session_limits{}) {
+  }
+
+  session(AsyncStreamT&& stream, std::shared_ptr<dispatcher_type> const& disp, session_limits limits)
     : stream_(std::move(stream))
     , dispatcher_(disp)
     , logger_(std::make_shared<async_logger>(stream_.get_executor()))
     , strand_(asio::make_strand(stream_.get_executor()))
     , async_manager_(strand_)
-    , write_channel_(stream_.get_executor(), 256) {
+    , write_channel_(stream_.get_executor(), 256)
+    , limits_(limits) {
     logger_->start();
+    // Seed the per-session request-rate bucket from the limits. All reads
+    // and mutations happen on msg_reader's coroutine, so no extra sync.
+    request_bucket_.capacity       = limits_.request_burst;
+    request_bucket_.refill_per_sec = limits_.request_rate_ps;
   }
 
   session(session&& other)
@@ -88,7 +100,8 @@ public:
     , dispatcher_(std::move(other.dispatcher_))
     , logger_(std::move(other.logger_))
     , strand_(std::move(other.strand_))
-    , write_channel_(std::move(other.write_channel_)) {
+    , write_channel_(std::move(other.write_channel_))
+    , limits_(std::move(other.limits_)) {
   }
 
   virtual ~session() {
@@ -98,6 +111,20 @@ public:
   auto handshake() -> asio::awaitable<bool> {
     co_return true;
   }
+
+  // Peer identity captured during the TLS handshake. Empty if the session is
+  // over plain TCP or the peer did not present a certificate. Set by the
+  // ssl_channel right after accept(); do not mutate from application code.
+  void set_peer_fingerprint(std::string fp) { peer_fingerprint_ = std::move(fp); }
+  std::string const& peer_fingerprint() const noexcept { return peer_fingerprint_; }
+
+  void set_peer_address(std::string addr) { peer_address_ = std::move(addr); }
+  std::string const& peer_address() const noexcept { return peer_address_; }
+
+  // Just the IP portion of peer_address, separately stored so per-IP
+  // connection counters can key on it without re-parsing.
+  void set_peer_ip(std::string ip) { peer_ip_ = std::move(ip); }
+  std::string const& peer_ip() const noexcept { return peer_ip_; }
 
   auto call(std::string const& call_name, buffer_type const& req_buffer, std::chrono::milliseconds timeout = std::chrono::seconds(30))
       -> asio::awaitable<buffer_type> {
@@ -134,10 +161,18 @@ public:
   }
 
   auto dispatch_requests() -> asio::awaitable<void> {
-    if (!stream_.is_open()) {
+    if (!stream_.lowest_layer().is_open()) {
       spdlog::error("rpc::session::dispatch_requests: socket is not open, aborting");
       co_return;
     }
+    // Keep the session alive for the entire lifetime of the reader/writer
+    // coroutines. Both msg_reader() and msg_writer() capture `this` via their
+    // member-function awaitables, so if the owning shared_ptr is released
+    // (e.g. the server drops the session from its map) while an async_read
+    // or parallel_group op is in flight, the completion handler ends up
+    // touching freed stream_/strand_/channels. This was the UAF that
+    // showed up as ~parallel_group_op_handler under ASan.
+    auto self = this->shared_from_this();
     using namespace asio::experimental::awaitable_operators;
     co_await (msg_reader() && msg_writer());
     co_return;
@@ -154,6 +189,21 @@ public:
     notification_header[MSG_TYPE_IDX]     = (static_cast<std::uint64_t>(msg_type::notification) << 32);
 
     co_await queue_write(std::move(notification_header), buffer_type(buffer));
+  }
+
+  // Non-blocking keepalive: queues a msg_type::nop so that a quiet client
+  // keeps the server's idle_timeout from firing. The server echoes nop (see
+  // the nop branch in msg_reader). Returns false if the write channel is
+  // full — in that case the session is already producing plenty of traffic,
+  // so skipping the ping is fine.
+  bool try_ping() {
+    header_type h{};
+    h[MAGIC_HEADER_IDX] = MAGIC_HEADER_NUMBER;
+    h[MSG_SIZE_IDX]     = 0;
+    h[MSG_TYPE_IDX]     = static_cast<std::uint64_t>(msg_type::nop) << 32;
+    h[CALL_ID_IDX]      = 0;
+    h[USER_TOKEN_IDX]   = 0;
+    return write_channel_.try_send(boost::system::error_code{}, write_item{std::move(h), buffer_type{}});
   }
 
   // Non-blocking notify: returns false if the write channel is full (client too slow)
@@ -194,10 +244,14 @@ public:
       // Ignore errors during cancellation
     }
 
-    // Close the underlying stream - use error_code version to avoid exceptions
-    // boost::system::error_code ec;
-    stream_.close();
-    // Ignore any errors from close - we're shutting down anyway
+    // Shutdown the socket before closing so pending async_reads unblock with
+    // a clean EOF rather than tearing down underneath an in-flight SSL composite
+    // op. lowest_layer() works for both tcp::socket and ssl::stream<tcp::socket>.
+    // We skip the SSL close_notify handshake on purpose — close() callers are
+    // abandoning the connection, not negotiating a graceful shutdown.
+    boost::system::error_code ec;
+    stream_.lowest_layer().shutdown(asio::socket_base::shutdown_both, ec);
+    stream_.lowest_layer().close(ec);
   }
 
   void set_notification_callback(notification_callback_type callback) {
@@ -234,12 +288,58 @@ private:
     close();
   }
 
+  // async_read + deadline. Each call owns its timer + cancellation_signal
+  // via a shared_ptr so the deadline handler stays valid even after the
+  // async_read has completed and this function has returned — the lambda
+  // gates its access with state->completed and only closes the loop by
+  // emitting cancellation if the read hasn't actually finished.
+  //
+  // We deliberately do NOT use awaitable_operators::`||` / parallel_group
+  // here: under SSL + tight loops, parallel_group's per-iteration
+  // cancellation-state alloc/teardown produced the ~parallel_group_op_handler
+  // UAF observed under ASan.
+  template <typename MutableBuffer>
+  auto deadline_read(MutableBuffer buffer, std::size_t size, std::chrono::milliseconds timeout) -> asio::awaitable<void> {
+    struct deadline_state {
+      asio::steady_timer        timer;
+      asio::cancellation_signal signal;
+      bool                      completed = false;
+      explicit deadline_state(asio::any_io_executor ex) : timer(std::move(ex)) {}
+    };
+
+    auto executor = co_await asio::this_coro::executor;
+    auto state    = std::make_shared<deadline_state>(executor);
+
+    state->timer.expires_after(timeout);
+    state->timer.async_wait([state](boost::system::error_code ec) {
+      if (ec || state->completed) return;
+      state->signal.emit(asio::cancellation_type::terminal);
+    });
+
+    auto [ec, bytes] = co_await asio::async_read(
+        stream_, buffer, asio::transfer_exactly(size),
+        asio::bind_cancellation_slot(
+            state->signal.slot(),
+            asio::as_tuple(asio::use_awaitable)));
+
+    state->completed = true;
+    state->timer.cancel();
+
+    if (ec == asio::error::operation_aborted)
+      throw boost::system::system_error(asio::error::timed_out, "deadline_read");
+    if (ec)
+      throw boost::system::system_error(ec, "deadline_read");
+    co_return;
+  }
+
   asio::awaitable<void> msg_reader() {
     try {
       for (;;) {
         header_type msg_header;
 
-        co_await asio::async_read(stream_, asio::buffer(msg_header.data(), msg_header.size() * sizeof(header_type::value_type)), asio::use_awaitable);
+        co_await deadline_read(asio::buffer(msg_header.data(), msg_header.size() * sizeof(header_type::value_type)),
+                               msg_header.size() * sizeof(header_type::value_type),
+                               limits_.idle_timeout);
 
         // spdlog::debug("Read {}: 0x{:X} {} 0x{:X} {} {}",
         //               __FUNCTION__,
@@ -258,7 +358,11 @@ private:
 
         switch (static_cast<msg_type>(msg_header[MSG_TYPE_IDX] >> 32)) {
           case msg_type::nop:
-            co_await respond(msg_type::nop, msg_header);
+            // One-way keepalive. Reading this header already reset the peer's
+            // idle_timeout via deadline_read, which is the whole point. Do NOT
+            // respond — this session class runs on both server and client, so
+            // a reply here would create an infinite ping-pong as soon as
+            // either side sends the first nop.
             break;
           case msg_type::request:
             co_await dispatch_request(msg_header);
@@ -311,17 +415,31 @@ private:
     auto executor = co_await asio::this_coro::executor;
     auto req_size = req_header[MSG_SIZE_IDX];
 
+    if (req_size > limits_.max_message_bytes) {
+      log_error_async("Rejecting oversized request: " + std::to_string(req_size)
+                      + " > limit " + std::to_string(limits_.max_message_bytes));
+      co_await respond(msg_type::error, req_header);
+      close();
+      co_return;
+    }
+
+    // Per-session request-rate gate. A breach returns an error and drains
+    // the body so the session stays framed. We deliberately don't close —
+    // a well-behaved client will back off; a broken one will keep hitting
+    // errors until idle_timeout reaps the session.
+    if (!request_bucket_.try_take()) {
+      log_error_async("Request rate limit exceeded");
+      buffer_type drain;
+      drain.resize(req_size);
+      co_await deadline_read(asio::buffer(drain), req_size, limits_.message_read_timeout);
+      co_await respond(msg_type::error, req_header);
+      co_return;
+    }
+
     buffer_type req_buffer;
     req_buffer.resize(req_size);
 
-    co_await asio::async_read(stream_, asio::buffer(req_buffer), asio::transfer_exactly(req_size), asio::use_awaitable);
-    // spdlog::debug("Read payload for {}: 0x{:X} {} 0x{:X} {} {}",
-    //               __FUNCTION__,
-    //               req_header[MAGIC_HEADER_IDX],
-    //               msg_type_to_string(to_msg_type(req_header[MSG_TYPE_IDX])),
-    //               req_header[CALL_ID_IDX],
-    //               req_header[USER_TOKEN_IDX],
-    //               req_header[MSG_SIZE_IDX]);
+    co_await deadline_read(asio::buffer(req_buffer), req_size, limits_.message_read_timeout);
 
     // Spawn request handling to avoid blocking the reader
     // IMPORTANT: Capture shared_from_this() to keep session alive while processing
@@ -333,12 +451,20 @@ private:
           try {
             auto& call_id = req_header[CALL_ID_IDX];
 
+            // Gatekeeper context. Identity comes from the TLS handshake,
+            // which ran before we accepted this session. The dispatcher
+            // enforces auth before invoking the handler — see enforce_auth.
+            client_context ctx{
+                .peer_fingerprint = self->peer_fingerprint_,
+                .peer_address     = self->peer_address_,
+            };
+
             // Check if the function is async and dispatch accordingly
             if (self->dispatcher_->is_async(call_id)) {
-              auto rsp_buffer = co_await self->dispatcher_->dispatch_async(call_id, req_buffer);
+              auto rsp_buffer = co_await self->dispatcher_->dispatch_async(call_id, req_buffer, ctx);
               co_await self->respond(msg_type::response, req_header, rsp_buffer);
             } else {
-              auto rsp_buffer = self->dispatcher_->dispatch(call_id, req_buffer);
+              auto rsp_buffer = self->dispatcher_->dispatch(call_id, req_buffer, ctx);
               co_await self->respond(msg_type::response, req_header, rsp_buffer);
             }
 
@@ -365,18 +491,18 @@ private:
 
   asio::awaitable<void> handle_response(header_type const& resp_header) {
     auto        rsp_size = resp_header[MSG_SIZE_IDX];
+
+    if (rsp_size > limits_.max_message_bytes) {
+      log_error_async("Rejecting oversized response: " + std::to_string(rsp_size)
+                      + " > limit " + std::to_string(limits_.max_message_bytes));
+      close();
+      co_return;
+    }
+
     buffer_type rsp_buffer;
     rsp_buffer.resize(rsp_size);
 
-    // spdlog::debug("Reading payload for {}: 0x{:X} {} 0x{:X} {} {}",
-    //               __FUNCTION__,
-    //               resp_header[MAGIC_HEADER_IDX],
-    //               msg_type_to_string(to_msg_type(resp_header[MSG_TYPE_IDX])),
-    //               resp_header[CALL_ID_IDX],
-    //               resp_header[USER_TOKEN_IDX],
-    //               resp_header[MSG_SIZE_IDX]);
-
-    co_await asio::async_read(stream_, asio::buffer(rsp_buffer), asio::transfer_exactly(rsp_size), asio::use_awaitable);
+    co_await deadline_read(asio::buffer(rsp_buffer), rsp_size, limits_.message_read_timeout);
 
     // spdlog::debug("Read payload for {}: 0x{:X} {} 0x{:X} {} {}",
     //               __FUNCTION__,
@@ -402,10 +528,17 @@ private:
     auto call_id  = msg_header[CALL_ID_IDX];
     auto req_size = msg_header[MSG_SIZE_IDX];
 
+    if (req_size > limits_.max_message_bytes) {
+      log_error_async("Rejecting oversized notification: " + std::to_string(req_size)
+                      + " > limit " + std::to_string(limits_.max_message_bytes));
+      close();
+      co_return;
+    }
+
     buffer_type buffer;
     buffer.resize(req_size);
 
-    co_await asio::async_read(stream_, asio::buffer(buffer), asio::transfer_exactly(req_size), asio::use_awaitable);
+    co_await deadline_read(asio::buffer(buffer), req_size, limits_.message_read_timeout);
 
     // Handle notification dispatch in a separate coroutine to avoid blocking
     // IMPORTANT: Capture shared_from_this() to keep session alive while processing
@@ -435,6 +568,26 @@ private:
 
   asio::awaitable<void> handle_error(header_type const& related_msg) {
     log_error_async("Received error message");
+
+    // Drain any error payload the peer attached so the next framed message
+    // starts at a clean boundary.
+    auto err_size = related_msg[MSG_SIZE_IDX];
+    if (err_size > 0) {
+      if (err_size > limits_.max_message_bytes) {
+        log_error_async("Rejecting oversized error frame: " + std::to_string(err_size));
+        close();
+        co_return;
+      }
+      buffer_type scratch;
+      scratch.resize(err_size);
+      co_await deadline_read(asio::buffer(scratch), err_size, limits_.message_read_timeout);
+    }
+
+    // Notify the pending client-side call (if any) so it raises instead of
+    // waiting for the RPC-call timeout. The token embedded in the error
+    // header echoes the original request's USER_TOKEN_IDX.
+    auto token = related_msg[USER_TOKEN_IDX];
+    co_await async_manager_.complete_operation_with_error(token, asio::error::invalid_argument);
     co_return;
   }
 
@@ -484,6 +637,11 @@ private:
   write_channel_type               write_channel_;
   notification_callback_type       notification_callback_;
   std::atomic<bool>                is_closed_{false};
+  session_limits                   limits_{};
+  std::string                      peer_fingerprint_;
+  std::string                      peer_address_;
+  std::string                      peer_ip_;
+  token_bucket                     request_bucket_;
 };
 
 } // namespace grlx::rpc
