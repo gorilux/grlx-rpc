@@ -124,9 +124,10 @@ struct tls_config {
   bool tls13_only = true;
 };
 
-// Per-session metadata surfaced to the application when a new session opens.
-// Apps can use it for logging, metrics, and binding auth tokens to the
-// client-cert fingerprint that was negotiated during the TLS handshake.
+// Per-session metadata surfaced to the application when a new session opens
+// or closes. Apps can use it for logging, metrics, and binding auth tokens
+// to the client-cert fingerprint that was negotiated during the TLS
+// handshake.
 struct session_info {
   // SHA-256 fingerprint of the peer's X.509 certificate in DER form,
   // rendered as lowercase hex (no colons, no prefix). Empty if no peer
@@ -136,13 +137,35 @@ struct session_info {
 
   // Remote endpoint in "host:port" form for logging / rate-limit buckets.
   std::string peer_address;
+
+  // Stable identifier for this session, valid for the lifetime of the
+  // connection. The same value is delivered to both on_session_open and
+  // on_session_close, so apps can pair them up to evict per-session state
+  // (e.g. ECS sync client_states_) on disconnect. Treat as opaque — the
+  // current implementation derives it from the session pointer, but
+  // future implementations may not.
+  std::uint64_t session_token = 0;
 };
 
 // Who's making this RPC call? Passed to the auth callback before the request
 // body has been decoded — identity here comes purely from the transport.
+//
+// Application-level handlers can also reach this via
+// `grlx::rpc::current_call_context()` (defined below) for the duration
+// of a synchronous prefix of their coroutine (i.e. before the first
+// co_await). Used by `entt_ext::sync_server`'s handshake handler to
+// stamp the generated session id back onto the calling rpc::session
+// via `set_logical_session_id` so server::notify_session can later
+// target it.
 struct client_context {
   std::string peer_fingerprint;
   std::string peer_address;
+
+  // Non-throwing callback bound to the calling session. Tags the
+  // session with a logical id that `server::notify_session` filters on.
+  // Empty / default-constructed when no session is bound (e.g.
+  // unit-test direct dispatch).
+  std::function<void(std::string)> set_logical_session_id;
 };
 
 // How strictly should the dispatcher gate a method?
@@ -158,6 +181,39 @@ enum class visibility {
   // Callback must both approve AND mark the caller as admin. Use for
   // privileged operations (user creation, role changes, destructive ops).
   admin,
+};
+
+// Thread-local pointer to the client_context for the currently-dispatching
+// RPC, set by `session::dispatch_request` for the duration of the call.
+// Handlers attached via `dispatcher::attach` can read this synchronously
+// at the top of their coroutine (before the first co_await) to access
+// peer identity or call `set_logical_session_id`. After the first
+// co_await the value is unreliable — the coroutine may resume on a
+// different thread and the original ctx may have already gone out of
+// scope. Consumers that need the data past a suspension point must
+// copy what they need locally.
+namespace detail {
+inline thread_local client_context const* current_ctx = nullptr;
+} // namespace detail
+
+inline client_context const* current_call_context() noexcept {
+  return detail::current_ctx;
+}
+
+// RAII setter used by session::dispatch_request to scope the
+// thread-local for one dispatch call.
+class current_call_context_scope {
+public:
+  explicit current_call_context_scope(client_context const* ctx) noexcept
+    : prev_(detail::current_ctx) {
+    detail::current_ctx = ctx;
+  }
+  ~current_call_context_scope() noexcept { detail::current_ctx = prev_; }
+  current_call_context_scope(current_call_context_scope const&)            = delete;
+  current_call_context_scope& operator=(current_call_context_scope const&) = delete;
+
+private:
+  client_context const* prev_;
 };
 
 // Outcome of an auth callback invocation. `deny_reason` is included only for

@@ -226,8 +226,9 @@ public:
 
   // Non-blocking keepalive. Returns false if no session or the write channel
   // is full. Apps with long idle periods (watching a video stream but not
-  // issuing RPCs) should call this periodically to avoid the server's
-  // idle_timeout closing the connection.
+  // issuing RPCs) should call this periodically to keep both peers'
+  // idle_timeouts from firing — the server replies with msg_type::pong so a
+  // single client-side ping resets *both* read deadlines.
   bool try_ping() {
     return client_session_ && client_session_->try_ping();
   }

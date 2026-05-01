@@ -135,11 +135,20 @@ public:
               // peer identity captured during the TLS handshake. This is
               // where auth layers learn the cert fingerprint to bind tokens
               // to, and where operators wire up connection logging.
+              //
+              // The session_token uniquely identifies the session for the
+              // lifetime of the connection: it is the raw shared_ptr address.
+              // Because the close hook fires before the session shared_ptr
+              // is released by active_sessions_, the token stays valid for
+              // the duration of both callbacks. After close, the token is
+              // not reused (a new accept allocates a fresh session_type).
+              std::uint64_t const session_token = reinterpret_cast<std::uint64_t>(session.get());
               if (on_session_open_) {
                 try {
                   on_session_open_(session_info{
                       .peer_fingerprint = session->peer_fingerprint(),
                       .peer_address     = session->peer_address(),
+                      .session_token    = session_token,
                   });
                 } catch (...) {
                   // A buggy hook must not kill the accept loop.
@@ -150,7 +159,7 @@ public:
               // Create individual strand for each session
               auto session_strand = asio::make_strand(executor);
 
-              asio::co_spawn(session_strand, session->dispatch_requests(), [session, this](std::exception_ptr error) {
+              asio::co_spawn(session_strand, session->dispatch_requests(), [session, this, session_token](std::exception_ptr error) {
                 // Release the seat we took in the global + per-IP counters
                 // so a future connect from this IP isn't wrongly rejected.
                 global_session_count_.fetch_sub(1, std::memory_order_acq_rel);
@@ -161,6 +170,24 @@ public:
                     if (--it->second == 0) {
                       per_ip_count_.erase(it);
                     }
+                  }
+                }
+
+                // Fire the application-visible "session closed" hook so
+                // app-level state keyed off the session (e.g. ECS sync
+                // client_states_) can be torn down promptly instead of
+                // accumulating per reconnect. Runs before the session is
+                // erased from active_sessions_, but the session shared_ptr
+                // is still alive via the lambda capture.
+                if (on_session_close_) {
+                  try {
+                    on_session_close_(session_info{
+                        .peer_fingerprint = session->peer_fingerprint(),
+                        .peer_address     = session->peer_address(),
+                        .session_token    = session_token,
+                    });
+                  } catch (...) {
+                    log_error_async("session_close hook threw");
                   }
                 }
 
@@ -270,6 +297,38 @@ public:
     return limits_;
   }
 
+  // Targeted notify — sends to sessions whose logical_session_id matches
+  // the given id, instead of broadcasting to all. Returns immediately if
+  // no session has that id (e.g. dropped before delivery). Used by
+  // entt_ext::sync to deliver per-tenant updates without leaking the
+  // payload bytes to unrelated sessions on the wire.
+  template <typename... ArgsT>
+  auto notify_session(std::string const& target_session_id, std::string const& func_name, ArgsT&&... args) -> asio::awaitable<void> {
+    if (!sessions_strand_ || target_session_id.empty()) {
+      co_return;
+    }
+
+    message_request<typename std::decay<ArgsT>::type...> request{std::make_tuple(std::forward<ArgsT>(args)...)};
+
+    buffer_type buffer;
+    encoder_type::encode(buffer, request);
+
+    auto sessions_copy = co_await asio::co_spawn(
+        *sessions_strand_,
+        [this]() -> asio::awaitable<std::unordered_set<std::shared_ptr<session_type>>> {
+          co_return active_sessions_;
+        },
+        asio::use_awaitable);
+
+    for (auto& session : sessions_copy) {
+      if (session->logical_session_id() == target_session_id) {
+        if (!session->try_notify(func_name, buffer)) {
+          log_warning_async("notify_session: write channel full for " + target_session_id + ", dropping " + func_name);
+        }
+      }
+    }
+  }
+
   template <typename... ArgsT>
   auto notify(std::string const& func_name, ArgsT&&... args) -> asio::awaitable<void> {
     if (!sessions_strand_) {
@@ -291,14 +350,16 @@ public:
         },
         asio::use_awaitable);
 
-    // Notify all sessions non-blocking — drop notifications for slow clients
+    // Notify all sessions non-blocking. If the per-session write channel is
+    // full we just drop the notification — the alternative (closing the
+    // session) caused a reconnection storm: a brand-new session would be
+    // added to active_sessions_ and the very next broadcast would overflow
+    // its channel before msg_writer had drained anything, killing the
+    // session ~3 ms after handshake. Sessions that genuinely can't keep up
+    // are reaped by the per-session idle_timeout in msg_reader instead.
     for (auto& session : sessions_copy) {
       if (!session->try_notify(func_name, buffer)) {
-        log_warning_async("Session write channel full, disconnecting slow client");
-        asio::post(*sessions_strand_, [this, session]() {
-          active_sessions_.erase(session);
-        });
-        session->close();
+        log_warning_async("Session write channel full, dropping notification: " + func_name);
       }
     }
 
@@ -375,6 +436,19 @@ public:
     on_session_open_ = std::move(cb);
   }
 
+  // Fires once per session as it tears down — after dispatch_requests has
+  // returned and per-IP / global counters have been released, but before
+  // the session shared_ptr is removed from active_sessions_. The callback
+  // sees the same session_token that on_session_open observed for this
+  // connection. Must be fast and non-throwing.
+  //
+  // Wire app-level state cleanup here (e.g. ECS sync client_states_) to
+  // avoid one-entry-per-reconnect leaks that bloat memory over time.
+  using session_close_callback = std::function<void(session_info const&)>;
+  void on_session_close(session_close_callback cb) {
+    on_session_close_ = std::move(cb);
+  }
+
 private:
   // Helper methods for non-blocking logging
   void log_error_async(const std::string& message) {
@@ -409,6 +483,7 @@ private:
   std::shared_ptr<async_logger>                                   logger_;
   session_limits                                                  session_limits_{};
   session_open_callback                                           on_session_open_;
+  session_close_callback                                          on_session_close_;
   server_limits                                                   limits_{};
   std::atomic<std::size_t>                                        global_session_count_{0};
   std::mutex                                                      per_ip_mutex_;

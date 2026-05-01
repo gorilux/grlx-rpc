@@ -69,7 +69,13 @@ public:
     request,
     response,
     notification,
-    error
+    error,
+    // Symmetric keepalive: a ping elicits a pong from the receiver. Either
+    // side may send ping; pong is sent only as a reply and never elicits
+    // a further reply, so there is no infinite loop. This keeps both
+    // peers' idle_timeout deadlines fresh from a single ping cadence.
+    ping,
+    pong
   };
 
   session(AsyncStreamT&& stream)
@@ -125,6 +131,14 @@ public:
   // connection counters can key on it without re-parsing.
   void set_peer_ip(std::string ip) { peer_ip_ = std::move(ip); }
   std::string const& peer_ip() const noexcept { return peer_ip_; }
+
+  // Logical session identifier set by the application layer (e.g.
+  // entt_ext::sync after a successful handshake). Used by
+  // server::notify_session to target notifications at one specific
+  // session rather than broadcasting. Distinct from the RPC-layer
+  // identity captured by peer_fingerprint / peer_address.
+  void set_logical_session_id(std::string id) { logical_session_id_ = std::move(id); }
+  std::string const& logical_session_id() const noexcept { return logical_session_id_; }
 
   auto call(std::string const& call_name, buffer_type const& req_buffer, std::chrono::milliseconds timeout = std::chrono::seconds(30))
       -> asio::awaitable<buffer_type> {
@@ -191,16 +205,17 @@ public:
     co_await queue_write(std::move(notification_header), buffer_type(buffer));
   }
 
-  // Non-blocking keepalive: queues a msg_type::nop so that a quiet client
-  // keeps the server's idle_timeout from firing. The server echoes nop (see
-  // the nop branch in msg_reader). Returns false if the write channel is
-  // full — in that case the session is already producing plenty of traffic,
-  // so skipping the ping is fine.
+  // Non-blocking keepalive: queues a msg_type::ping. The receiver replies
+  // with msg_type::pong (see msg_reader), which resets *this* end's read
+  // deadline too — so a single periodic ping from one side keeps both
+  // peers' idle_timeout deadlines fresh. Returns false if the write
+  // channel is full; in that case the session is already producing
+  // plenty of traffic, so skipping the ping is fine.
   bool try_ping() {
     header_type h{};
     h[MAGIC_HEADER_IDX] = MAGIC_HEADER_NUMBER;
     h[MSG_SIZE_IDX]     = 0;
-    h[MSG_TYPE_IDX]     = static_cast<std::uint64_t>(msg_type::nop) << 32;
+    h[MSG_TYPE_IDX]     = static_cast<std::uint64_t>(msg_type::ping) << 32;
     h[CALL_ID_IDX]      = 0;
     h[USER_TOKEN_IDX]   = 0;
     return write_channel_.try_send(boost::system::error_code{}, write_item{std::move(h), buffer_type{}});
@@ -358,11 +373,26 @@ private:
 
         switch (static_cast<msg_type>(msg_header[MSG_TYPE_IDX] >> 32)) {
           case msg_type::nop:
-            // One-way keepalive. Reading this header already reset the peer's
-            // idle_timeout via deadline_read, which is the whole point. Do NOT
-            // respond — this session class runs on both server and client, so
-            // a reply here would create an infinite ping-pong as soon as
-            // either side sends the first nop.
+            // Fire-and-forget keepalive. Reading the bytes already reset
+            // our read deadline; intentionally no reply.
+            break;
+          case msg_type::ping: {
+            // Symmetric keepalive. The peer wants its read deadline reset
+            // too, so reply with pong. Non-blocking — if the write channel
+            // is full the peer will retry on its next keepalive tick.
+            header_type pong_h{};
+            pong_h[MAGIC_HEADER_IDX] = MAGIC_HEADER_NUMBER;
+            pong_h[MSG_SIZE_IDX]     = 0;
+            pong_h[MSG_TYPE_IDX]     = static_cast<std::uint64_t>(msg_type::pong) << 32;
+            pong_h[CALL_ID_IDX]      = 0;
+            pong_h[USER_TOKEN_IDX]   = 0;
+            (void)write_channel_.try_send(boost::system::error_code{}, write_item{std::move(pong_h), buffer_type{}});
+            break;
+          }
+          case msg_type::pong:
+            // Reply to our ping. Reading the bytes already reset our read
+            // deadline — that's the whole point. No further reply, which
+            // is what prevents an infinite ping-pong loop.
             break;
           case msg_type::request:
             co_await dispatch_request(msg_header);
@@ -454,10 +484,25 @@ private:
             // Gatekeeper context. Identity comes from the TLS handshake,
             // which ran before we accepted this session. The dispatcher
             // enforces auth before invoking the handler — see enforce_auth.
+            // The set_logical_session_id callback lets the handler
+            // (typically a custom handshake) tag this session with a
+            // logical id for use by server::notify_session.
+            std::weak_ptr<session> weak_self = self;
             client_context ctx{
                 .peer_fingerprint = self->peer_fingerprint_,
                 .peer_address     = self->peer_address_,
+                .set_logical_session_id = [weak_self](std::string id) {
+                  if (auto s = weak_self.lock()) {
+                    s->set_logical_session_id(std::move(id));
+                  }
+                },
             };
+
+            // Make the ctx visible to the handler via
+            // current_call_context() for the synchronous prefix of its
+            // coroutine. Handlers must read it before the first
+            // co_await — after a suspension the value is unreliable.
+            current_call_context_scope ctx_scope(&ctx);
 
             // Check if the function is async and dispatch accordingly
             if (self->dispatcher_->is_async(call_id)) {
@@ -620,6 +665,10 @@ private:
         return "notification";
       case msg_type::error:
         return "error";
+      case msg_type::ping:
+        return "ping";
+      case msg_type::pong:
+        return "pong";
     }
     return "unknown";
   }
@@ -641,6 +690,7 @@ private:
   std::string                      peer_fingerprint_;
   std::string                      peer_address_;
   std::string                      peer_ip_;
+  std::string                      logical_session_id_;
   token_bucket                     request_bucket_;
 };
 
