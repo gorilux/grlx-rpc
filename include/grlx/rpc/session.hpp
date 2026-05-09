@@ -4,8 +4,7 @@
 #include "async_manager.hpp"
 #include "dispatcher.hpp"
 #include "security.hpp"
-
-#include <grlx/tmpl/string_hash.hpp>
+#include "string_hash.hpp"
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -283,7 +282,12 @@ private:
   asio::awaitable<void> msg_writer() {
     try {
       for (;;) {
-        auto [ec, item] = co_await write_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+        // Name the as_tuple result and structured-bind by reference. With an
+        // anonymous `auto [ec, item] = co_await …`, GCC's CFG analysis
+        // emits a spurious -Wmaybe-uninitialized about the temporary across
+        // the suspension point.
+        auto recv_result = co_await write_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+        auto& [ec, item] = recv_result;
         if (ec)
           break;
 

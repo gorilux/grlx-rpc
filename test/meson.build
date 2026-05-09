@@ -24,25 +24,10 @@ test_common_deps = [
   openssl_dep,
 ]
 
-# grlx_headers_dep is appended below once computed.
-
 test_common_inc = [
   include_directories('../include'),
   include_directories('.'),
 ]
-
-# session.hpp pulls in <grlx/tmpl/string_hash.hpp> from the separate grlx
-# header-only library. Add its include path without linking the whole library.
-grlx_headers_path = meson.global_source_root() / 'subprojects' / 'grlx' / 'include'
-if not import('fs').exists(grlx_headers_path)
-  # Standalone builds won't have the sibling grlx subproject; fall back to
-  # the local rpc/string_hash.hpp via a small shim header in tests.
-  grlx_headers_dep = declare_dependency()
-else
-  grlx_headers_dep = declare_dependency(
-    compile_args: ['-isystem', grlx_headers_path],
-  )
-endif
 
 test_files = {
   'test_rpc':        {'sources': ['test_rpc.cpp']},
@@ -58,7 +43,7 @@ foreach name, spec : test_files
   exe = executable(
     name,
     sources: spec['sources'],
-    dependencies: test_common_deps + [grlx_headers_dep] + extra_deps,
+    dependencies: test_common_deps + extra_deps,
     include_directories: test_common_inc,
   )
   test('grlx-rpc ' + name, exe, suite: 'grlx-rpc', timeout: 30)
