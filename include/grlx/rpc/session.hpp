@@ -9,6 +9,8 @@
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -187,6 +189,14 @@ public:
     // showed up as ~parallel_group_op_handler under ASan.
     auto self = this->shared_from_this();
     using namespace asio::experimental::awaitable_operators;
+    // Hop to the session strand before launching msg_reader / msg_writer.
+    // The SSL stream is not safe for concurrent access: SSL_read and SSL_write
+    // touch the same OpenSSL state, and on a multi-threaded io_context (e.g.
+    // entt_ext's concurrent_io_context) async_read and async_write completions
+    // can resume on different worker threads at the same time, producing
+    // "bad record mac" errors. Running both coroutines on the strand
+    // serializes every async op issued against stream_.
+    co_await asio::dispatch(asio::bind_executor(strand_, asio::use_awaitable));
     co_await (msg_reader() && msg_writer());
     co_return;
   }
@@ -446,7 +456,9 @@ private:
   }
 
   asio::awaitable<void> dispatch_request(header_type const& req_header) {
-    auto executor = co_await asio::this_coro::executor;
+    // Use the strand's inner executor (the underlying io_context), not the
+    // strand itself — handlers run in parallel; only stream_ I/O is strand-bound.
+    auto executor = strand_.get_inner_executor();
     auto req_size = req_header[MSG_SIZE_IDX];
 
     if (req_size > limits_.max_message_bytes) {

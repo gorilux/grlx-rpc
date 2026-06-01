@@ -74,20 +74,27 @@ public:
     // with the io_context reactor it was created on; dispatching on a different executor
     // would cause a null reactor_data crash on platforms like Android).
     auto socket_executor = client_session_->next_layer().get_executor();
-    asio::co_spawn(socket_executor, client_session_->dispatch_requests(), [this](std::exception_ptr error) {
-      if (error) {
-        try {
-          std::rethrow_exception(error);
-        } catch (std::exception const& e) {
-          spdlog::error("rpc::client::dispatch_requests error: {}", e.what());
-        } catch (...) {
-          spdlog::error("rpc::client::dispatch_requests unknown error");
+    asio::co_spawn(socket_executor, client_session_->dispatch_requests(),
+      [this, weak_session = std::weak_ptr<session_type>(client_session_)](std::exception_ptr error) {
+        if (error) {
+          try {
+            std::rethrow_exception(error);
+          } catch (std::exception const& e) {
+            spdlog::error("rpc::client::dispatch_requests error: {}", e.what());
+          } catch (...) {
+            spdlog::error("rpc::client::dispatch_requests unknown error");
+          }
         }
-      }
-      // Session is dead — clear it so is_connected() returns false
-      // and the health-check system can trigger reconnection.
-      client_session_.reset();
-    });
+        // Session is dead — clear it so is_connected() returns false and the
+        // health-check system can trigger reconnection. Only clear if this is
+        // still the *current* session: after disconnect()+reconnect(), the
+        // old session's completion handler can fire after the new session is
+        // installed, and we must not clobber it.
+        auto self = weak_session.lock();
+        if (self && client_session_ == self) {
+          client_session_.reset();
+        }
+      });
 
     co_return;
   }
@@ -234,7 +241,14 @@ public:
   }
 
   void disconnect() {
-    // channel_.close();
+    // Tear down the socket so the session's msg_reader/msg_writer unblock and
+    // exit. Without this, the session stays alive via its own shared_from_this
+    // inside dispatch_requests(), the server keeps streaming notifications,
+    // and every one of them logs "unhandled notification" because we've cleared
+    // notification_handlers_ below.
+    if (client_session_) {
+      client_session_->close();
+    }
     client_session_.reset();
     function_hash_cache_.clear();
     notification_handlers_.clear();
