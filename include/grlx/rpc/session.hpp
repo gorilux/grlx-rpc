@@ -79,20 +79,24 @@ public:
     pong
   };
 
-  session(AsyncStreamT&& stream)
-    : session(std::move(stream), std::make_shared<dispatcher_type>(), session_limits{}) {
+  // io_bound_executor is the executor that stream_ I/O is serialized on. The
+  // CHANNEL supplies it (a strand for SSL, the raw executor for TCP); the
+  // session never decides serialization for the underlying transport itself.
+  session(AsyncStreamT&& stream, executor_type io_bound_executor)
+    : session(std::move(stream), std::move(io_bound_executor), std::make_shared<dispatcher_type>(), session_limits{}) {
   }
 
-  session(AsyncStreamT&& stream, std::shared_ptr<dispatcher_type> const& disp)
-    : session(std::move(stream), disp, session_limits{}) {
+  session(AsyncStreamT&& stream, executor_type io_bound_executor, std::shared_ptr<dispatcher_type> const& disp)
+    : session(std::move(stream), std::move(io_bound_executor), disp, session_limits{}) {
   }
 
-  session(AsyncStreamT&& stream, std::shared_ptr<dispatcher_type> const& disp, session_limits limits)
+  session(AsyncStreamT&& stream, executor_type io_bound_executor, std::shared_ptr<dispatcher_type> const& disp, session_limits limits)
     : stream_(std::move(stream))
     , dispatcher_(disp)
     , logger_(std::make_shared<async_logger>(stream_.get_executor()))
-    , strand_(asio::make_strand(stream_.get_executor()))
-    , async_manager_(strand_)
+    , io_bound_executor_(std::move(io_bound_executor))
+    , notification_strand_(asio::make_strand(stream_.get_executor()))
+    , async_manager_(io_bound_executor_)
     , write_channel_(stream_.get_executor(), 256)
     , limits_(limits) {
     logger_->start();
@@ -102,14 +106,16 @@ public:
     request_bucket_.refill_per_sec = limits_.request_rate_ps;
   }
 
-  session(session&& other)
-    : stream_(std::move(other.stream_))
-    , dispatcher_(std::move(other.dispatcher_))
-    , logger_(std::move(other.logger_))
-    , strand_(std::move(other.strand_))
-    , write_channel_(std::move(other.write_channel_))
-    , limits_(std::move(other.limits_)) {
-  }
+  // Sessions are always owned via std::make_shared and never moved or copied
+  // (enable_shared_from_this + shared_ptr throughout — see ssl_channel /
+  // tcp_channel, which only ever std::move the *socket* into make_shared).
+  // The old move ctor silently omitted async_manager_ (left unbound — its ctor
+  // needs io_bound_executor_), request_bucket_ (left zero-capacity → would reject every
+  // request), and the peer_*/logical_session_id_ identity. A moved-into session
+  // was therefore broken. Forbid moves outright so it can never happen by
+  // accident; copy is already implicitly deleted by the non-copyable members.
+  session(session&&)            = delete;
+  session& operator=(session&&) = delete;
 
   virtual ~session() {
     close();
@@ -141,11 +147,17 @@ public:
   void set_logical_session_id(std::string id) { logical_session_id_ = std::move(id); }
   std::string const& logical_session_id() const noexcept { return logical_session_id_; }
 
+  // Authenticated device identity, stamped by the application's handshake
+  // handler after auth succeeds (see client_context::set_logical_device_id).
+  // Surfaced to every subsequent call via current_call_context() so handlers
+  // can authorize against it instead of trusting per-request payload fields.
+  void set_logical_device_id(std::string id) { logical_device_id_ = std::move(id); }
+  std::string const& logical_device_id() const noexcept { return logical_device_id_; }
+
   auto call(std::string const& call_name, buffer_type const& req_buffer, std::chrono::milliseconds timeout = std::chrono::seconds(30))
       -> asio::awaitable<buffer_type> {
 
-    auto executor = co_await asio::this_coro::executor;
-    auto call_id  = shash64(call_name);
+    auto call_id = shash64(call_name);
 
     // Create a channel for this request (capacity 1)
 
@@ -185,18 +197,27 @@ public:
     // member-function awaitables, so if the owning shared_ptr is released
     // (e.g. the server drops the session from its map) while an async_read
     // or parallel_group op is in flight, the completion handler ends up
-    // touching freed stream_/strand_/channels. This was the UAF that
+    // touching freed stream_/channels. This was the UAF that
     // showed up as ~parallel_group_op_handler under ASan.
     auto self = this->shared_from_this();
     using namespace asio::experimental::awaitable_operators;
-    // Hop to the session strand before launching msg_reader / msg_writer.
-    // The SSL stream is not safe for concurrent access: SSL_read and SSL_write
-    // touch the same OpenSSL state, and on a multi-threaded io_context (e.g.
-    // entt_ext's concurrent_io_context) async_read and async_write completions
-    // can resume on different worker threads at the same time, producing
-    // "bad record mac" errors. Running both coroutines on the strand
-    // serializes every async op issued against stream_.
-    co_await asio::dispatch(asio::bind_executor(strand_, asio::use_awaitable));
+    // SSL serialization contract: this coroutine MUST be co_spawned on the
+    // session's I/O executor (io_bound_executor_) by the caller — the client via
+    // session->io_executor() (client.hpp), the server likewise (server.hpp).
+    // That spawn executor is what the `&&` below propagates to msg_reader /
+    // msg_writer, so every SSL_read / SSL_write against stream_ runs on the one
+    // executor and never concurrently. For SSL io_bound_executor_ is a strand
+    // (ssl_channel); for plain TCP it's the raw executor (one read + one write is
+    // safe there). OpenSSL state is shared between read and write — concurrent
+    // access corrupts records → "decryption failed / bad record mac".
+    //
+    // The dispatch() resumes us on io_bound_executor_, but note it does NOT
+    // rebind this_coro::executor: the `&&` children inherit the *spawn* executor,
+    // not the resumed-on one. So spawning on the strand (above) is the load-
+    // bearing part; the hop is belt-and-suspenders. Relying on the hop alone,
+    // with the coroutine spawned on a raw multi-threaded executor, WAS the bug —
+    // reader/writer ran off-strand and raced under the file-sync push flood.
+    co_await asio::dispatch(asio::bind_executor(io_bound_executor_, asio::use_awaitable));
     co_await (msg_reader() && msg_writer());
     co_return;
   }
@@ -251,12 +272,28 @@ public:
     return stream_;
   }
 
+  // The executor all stream I/O is serialized on (a strand for SSL, the raw
+  // executor for TCP), supplied by the channel. The caller MUST co_spawn
+  // dispatch_requests() on THIS so msg_reader/msg_writer inherit it and never
+  // touch the SSL stream concurrently — see the contract in dispatch_requests().
+  // It is a strand over the socket's own io_context, so spawning on it preserves
+  // reactor affinity (the socket is still driven by the io_context it was
+  // registered with).
+  executor_type io_executor() const noexcept { return io_bound_executor_; }
+
   void close() {
     // Prevent double-close using atomic flag
     bool expected = false;
     if (!is_closed_.compare_exchange_strong(expected, true)) {
       return; // Already closed
     }
+
+    // One-shot teardown marker. Because close() is idempotent, this logs
+    // exactly once per session, at the instant teardown begins — whichever
+    // side logs it first (by wall-clock across the two processes) is the side
+    // that initiated the disconnect. Pair it with the msg_writer / msg_reader
+    // exit logs to see *why* (which coroutine's socket op failed first).
+    log_error_async("rpc::session: close() — tearing down (peer=" + peer_address_ + ")");
 
     // Close write channel so msg_writer exits
     write_channel_.close();
@@ -307,12 +344,18 @@ private:
         co_await asio::async_write(stream_, buffers, asio::use_awaitable);
       }
     } catch (boost::system::system_error const& e) {
-      if (e.code() != asio::error::eof && e.code() != asio::error::connection_reset && e.code() != asio::error::broken_pipe &&
-          e.code() != asio::error::operation_aborted) {
-        log_error_async("Write error: " + e.code().message());
-      }
+      // Always log the writer's exit reason (even the "expected" close codes).
+      // msg_writer only reaches this catch when async_write itself failed —
+      // i.e. THIS side's write broke the socket, making this side the
+      // teardown initiator. The reader's loud error on the peer is then just
+      // the downstream truncation. Knowing the exact code (broken_pipe vs
+      // connection_reset vs an SSL error) is what disambiguates the otherwise
+      // circular "both sides see truncation" picture.
+      log_error_async("msg_writer exiting (peer=" + peer_address_ + "): " + e.code().message()
+                      + " [cat=" + e.code().category().name()
+                      + " val=" + std::to_string(e.code().value()) + "]");
     } catch (...) {
-      log_error_async("Unknown write error");
+      log_error_async("msg_writer exiting (peer=" + peer_address_ + "): unknown error");
     }
     close();
   }
@@ -379,13 +422,24 @@ private:
         //               msg_header[MSG_SIZE_IDX]);
 
         if (MAGIC_HEADER_NUMBER != msg_header[MAGIC_HEADER_IDX]) {
-          // Log error asynchronously without blocking
-          log_error_async("Invalid magic header: " + std::to_string(msg_header[MSG_TYPE_IDX] >> 32));
-          co_await respond(msg_type::error, msg_header);
-          continue;
+          // A bad magic means the stream is desynchronized — we just read
+          // bytes from the middle of some frame's body as if they were a
+          // header. There is NO in-band way to resync a length-prefixed
+          // multiplexed stream; the only correct action is to drop the
+          // session so both ends reconnect and reframe from scratch.
+          //
+          // The previous behavior (send an error built from the garbage
+          // header, then `continue`) was the root of the mid-sync crashes:
+          // it kept reading garbage frame after frame until one coincidentally
+          // parsed as a `response`, at which point a junk body was decoded
+          // into a real pending call and corrupted it (the cereal underflow
+          // SIGSEGV). Never continue past a framing violation.
+          log_error_async("Invalid magic header (stream desync) — closing session");
+          break;
         }
 
-        switch (static_cast<msg_type>(msg_header[MSG_TYPE_IDX] >> 32)) {
+        auto const incoming_type = static_cast<msg_type>(msg_header[MSG_TYPE_IDX] >> 32);
+        switch (incoming_type) {
           case msg_type::nop:
             // Fire-and-forget keepalive. Reading the bytes already reset
             // our read deadline; intentionally no reply.
@@ -420,6 +474,15 @@ private:
           case msg_type::error:
             co_await handle_error(msg_header);
             break;
+          default:
+            // Valid magic but an unknown message type is also a framing
+            // violation (or a protocol mismatch). Don't try to interpret the
+            // body — drop the session and reconnect.
+            log_error_async("Unknown message type "
+                            + std::to_string(static_cast<std::uint64_t>(incoming_type))
+                            + " — closing session");
+            close();
+            co_return;
         }
       }
     } catch (boost::system::system_error const& e) {
@@ -428,8 +491,11 @@ private:
         // Connection closed - this is expected during shutdown
         log_error_async("Connection closed: " + e.code().message());
       } else {
-        // Unexpected error
-        log_error_async("Unexpected error in msg_reader: " + e.code().message());
+        // Unexpected error — include category + value so a vague generic
+        // message ("unspecified system error") is still diagnosable.
+        log_error_async("Unexpected error in msg_reader: " + e.code().message()
+                        + " [cat=" + e.code().category().name()
+                        + " val=" + std::to_string(e.code().value()) + "]");
       }
     } catch (std::exception const& e) {
       // Catch any other standard exceptions
@@ -456,9 +522,12 @@ private:
   }
 
   asio::awaitable<void> dispatch_request(header_type const& req_header) {
-    // Use the strand's inner executor (the underlying io_context), not the
-    // strand itself — handlers run in parallel; only stream_ I/O is strand-bound.
-    auto executor = strand_.get_inner_executor();
+    // Run handlers on the raw io_context (stream_.get_executor()), NOT on
+    // io_bound_executor_ — handlers run in parallel; only stream_ I/O is bound
+    // to io_bound_executor_. The socket is never itself stranded (the channel
+    // hands us a separate strand for I/O), so stream_.get_executor() is the
+    // unserialized io_context.
+    auto executor = stream_.get_executor();
     auto req_size = req_header[MSG_SIZE_IDX];
 
     if (req_size > limits_.max_message_bytes) {
@@ -510,6 +579,15 @@ private:
                 .set_logical_session_id = [weak_self](std::string id) {
                   if (auto s = weak_self.lock()) {
                     s->set_logical_session_id(std::move(id));
+                  }
+                },
+                // The device identity already bound to the session (by an earlier
+                // handshake call); handlers read this to authorize. The setter
+                // lets the handshake handler stamp it after auth succeeds.
+                .logical_device_id = self->logical_device_id_,
+                .set_logical_device_id = [weak_self](std::string id) {
+                  if (auto s = weak_self.lock()) {
+                    s->set_logical_device_id(std::move(id));
                   }
                 },
             };
@@ -601,12 +679,16 @@ private:
 
     co_await deadline_read(asio::buffer(buffer), req_size, limits_.message_read_timeout);
 
-    // Handle notification dispatch in a separate coroutine to avoid blocking
+    // Dispatch the notification on the dedicated notification_strand_, NOT the
+    // I/O strand we're currently on: the handler runs synchronously (no
+    // suspension before the work), so leaving it here would block the next
+    // async_read and any pending async_write until it returns. The notification
+    // strand keeps handlers off the I/O path while still serializing them, so
+    // inbound updates apply in wire order (see notification_strand_'s decl).
     // IMPORTANT: Capture shared_from_this() to keep session alive while processing
-    auto executor = co_await asio::this_coro::executor;
-    auto self     = this->shared_from_this();
+    auto self = this->shared_from_this();
     asio::co_spawn(
-        executor,
+        notification_strand_,
         [self, call_id, buffer_data = std::move(buffer)]() mutable -> asio::awaitable<void> {
           try {
             // Use notification callback if set (for client-side), otherwise use dispatcher (for server-side)
@@ -697,7 +779,25 @@ private:
   AsyncStreamT                     stream_;
   std::shared_ptr<dispatcher_type> dispatcher_;
   std::shared_ptr<async_logger>    logger_;
-  asio::strand<executor_type>      strand_;
+  // The executor that all stream_ I/O (async_read / async_write) is bound to.
+  // Provided by the channel that created this session, NOT created here: only
+  // the channel knows whether the underlying stream needs serialization. For
+  // SSL the channel passes a strand (SSL_read/SSL_write share OpenSSL state and
+  // must never run concurrently); for plain TCP it passes the raw executor (one
+  // concurrent read + one concurrent write is safe, so no strand needed). The
+  // session itself stays transport-agnostic. stream_.get_executor() remains the
+  // *unserialized* io_context, used below for the off-I/O work.
+  executor_type                    io_bound_executor_;
+  // Notifications are dispatched on their own strand — off io_bound_executor_ so
+  // a non-trivial handler (e.g. decoding a large synced component) can't stall
+  // the next async_read / pending async_write, yet still serialized so inbound
+  // notifications are applied in wire order. Order matters: server→client sync
+  // rides notifications and the client applies them with emplace_or_replace
+  // (last-applied-wins, no version guard), so parallel dispatch would let a
+  // stale update clobber a fresh one. Built on the raw io_context
+  // (stream_.get_executor()), independent of the I/O executor. Requests, being
+  // independent, use the parallel io_context directly (see dispatch_request).
+  asio::strand<executor_type>      notification_strand_;
   async_manager_type               async_manager_;
   write_channel_type               write_channel_;
   notification_callback_type       notification_callback_;
@@ -707,6 +807,7 @@ private:
   std::string                      peer_address_;
   std::string                      peer_ip_;
   std::string                      logical_session_id_;
+  std::string                      logical_device_id_;
   token_bucket                     request_bucket_;
 };
 

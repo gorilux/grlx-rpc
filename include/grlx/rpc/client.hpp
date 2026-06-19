@@ -1,6 +1,5 @@
 #pragma once
 
-#include "buffer_pool.hpp"
 #include "dispatcher.hpp"
 #include "message.hpp"
 
@@ -10,9 +9,11 @@
 #include <spdlog/spdlog.h>
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <future>
 #include <istream>
+#include <mutex>
 #include <memory>
 #include <ostream>
 #include <stdexcept>
@@ -25,6 +26,56 @@ namespace grlx::rpc {
 
 namespace asio = boost::asio;
 
+// Portable thread-safe shared_ptr holder with the subset of the
+// std::atomic<std::shared_ptr<>> API we need. C++20's atomic<shared_ptr>
+// specialization is NOT implemented by the Android NDK's libc++ (its
+// std::atomic<T> hard-requires a trivially-copyable T), so we can't use it.
+// A single mutex gives identical load/store/exchange/compare_exchange
+// semantics on every toolchain. The held pointer is touched only on
+// connect / disconnect / once per RPC call — never a hot loop — so the lock
+// cost is negligible next to the network round-trip it guards.
+template <typename T>
+class synchronized_shared_ptr {
+public:
+  synchronized_shared_ptr() = default;
+  explicit synchronized_shared_ptr(std::shared_ptr<T> v)
+    : ptr_(std::move(v)) {
+  }
+
+  std::shared_ptr<T> load() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ptr_;
+  }
+
+  void store(std::shared_ptr<T> v) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ptr_ = std::move(v);
+  }
+
+  std::shared_ptr<T> exchange(std::shared_ptr<T> v) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ptr_.swap(v);
+    return v;
+  }
+
+  // Atomically set to `desired` iff the current value equals `expected`.
+  // On failure, refresh `expected` with the current value (mirrors the
+  // std::atomic contract we relied on).
+  bool compare_exchange_strong(std::shared_ptr<T>& expected, std::shared_ptr<T> desired) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ptr_ == expected) {
+      ptr_ = std::move(desired);
+      return true;
+    }
+    expected = ptr_;
+    return false;
+  }
+
+private:
+  mutable std::mutex            mutex_;
+  std::shared_ptr<T>            ptr_;
+};
+
 template <typename ChannelT>
 class client {
 public:
@@ -36,14 +87,12 @@ public:
 
   template <typename... ArgsT>
   client(ArgsT&&... args)
-    : channel_(std::forward<ArgsT>(args)...)
-    , buffer_pool_(std::make_unique<buffer_pool>(32, 1024, 4096)) {
+    : channel_(std::forward<ArgsT>(args)...) {
   }
 
   client(client&& other)
     : channel_(std::move(other.channel_))
-    , client_session_(std::move(other.client_session_))
-    , buffer_pool_(std::move(other.buffer_pool_))
+    , client_session_(other.client_session_.load())
     , function_hash_cache_(std::move(other.function_hash_cache_)) {
   }
 
@@ -56,26 +105,35 @@ public:
   asio::awaitable<void> connect(EndpointT const& endpoint) {
     auto executor = co_await asio::this_coro::executor;
 
-    client_session_ = co_await channel_.connect(endpoint);
+    auto session = co_await channel_.connect(endpoint);
 
     // Descend to the TCP socket via lowest_layer() so the check works for both
     // plain tcp_channel and ssl_channel (where next_layer() is ssl::stream).
-    if (!client_session_ || !client_session_->next_layer().lowest_layer().is_open()) {
-      client_session_.reset();
+    if (!session || !session->next_layer().lowest_layer().is_open()) {
+      client_session_.store(nullptr);
       throw std::runtime_error("rpc::client::connect: invalid session after connect");
     }
 
-    co_await client_session_->handshake();
+    co_await session->handshake();
 
-    // Set up notification handling in the session
-    setup_notification_handling();
+    // Publish the session only after the handshake succeeds. Set up notification
+    // handling against the local session (not the member) so a concurrent
+    // disconnect can't null it out from under us here.
+    setup_notification_handling(session);
+    client_session_.store(session);
 
-    // Use the socket's own executor to ensure reactor affinity (the socket is registered
-    // with the io_context reactor it was created on; dispatching on a different executor
-    // would cause a null reactor_data crash on platforms like Android).
-    auto socket_executor = client_session_->next_layer().get_executor();
-    asio::co_spawn(socket_executor, client_session_->dispatch_requests(),
-      [this, weak_session = std::weak_ptr<session_type>(client_session_)](std::exception_ptr error) {
+    // Spawn dispatch_requests on the session's I/O executor (io_executor()),
+    // NOT the bare socket executor. dispatch_requests relies on its spawn
+    // executor to serialize msg_reader/msg_writer — SSL is not safe for
+    // concurrent SSL_read/SSL_write, and spawning on the raw multi-threaded
+    // socket executor let them race and corrupt TLS records under the push flood
+    // ("bad record mac"). io_executor() is a strand over the socket's own
+    // io_context (ssl_channel builds it from the socket executor), so reactor
+    // affinity is preserved — the socket is still driven by the io_context it was
+    // registered with (no null reactor_data crash on Android), just serialized.
+    auto io_executor = session->io_executor();
+    asio::co_spawn(io_executor, session->dispatch_requests(),
+      [this, weak_session = std::weak_ptr<session_type>(session)](std::exception_ptr error) {
         if (error) {
           try {
             std::rethrow_exception(error);
@@ -91,8 +149,12 @@ public:
         // old session's completion handler can fire after the new session is
         // installed, and we must not clobber it.
         auto self = weak_session.lock();
-        if (self && client_session_ == self) {
-          client_session_.reset();
+        if (self) {
+          // Only clear if this is still the current session — compare_exchange
+          // makes the check-and-clear atomic so it can't clobber a session
+          // installed by a concurrent reconnect.
+          std::shared_ptr<session_type> expected = self;
+          client_session_.compare_exchange_strong(expected, nullptr);
         }
       });
 
@@ -101,14 +163,29 @@ public:
 
   template <typename ReturnT, typename... ArgsT>
   auto invoke(std::string const& func_name, ArgsT&&... args) -> asio::awaitable<ReturnT> {
-    // Optimize: Check connection first before any allocations
-    if (!client_session_) [[unlikely]] {
+    co_return co_await invoke_with_timeout<ReturnT>(std::chrono::seconds(30), func_name, std::forward<ArgsT>(args)...);
+  }
+
+  // invoke with an explicit per-call timeout. Short control calls (e.g. the
+  // sync handshake) should pass a small timeout so a lost request becomes a
+  // quick retry on a fresh session instead of a 30 s "Connecting..." stall.
+  template <typename ReturnT, typename... ArgsT>
+  auto invoke_with_timeout(std::chrono::milliseconds timeout, std::string const& func_name, ArgsT&&... args) -> asio::awaitable<ReturnT> {
+    // Load the session ONCE into a local. This is the critical fix for the
+    // concurrent-disconnect race: a plain re-read of client_session_ at the
+    // call site could be torn by a concurrent reset() and hand call() a null
+    // `this`. The local copy is both synchronized (atomic load) and keeps the
+    // session object alive for the whole call, even if a reconnect swaps the
+    // member out underneath us.
+    auto session = client_session_.load();
+    if (!session) [[unlikely]] {
       throw std::runtime_error("not connected");
     }
 
-    // Fix: Use buffer pool correctly - the session.call() needs a const reference, not moved buffer
-    auto  req_buffer_guard = buffer_pool_->get_buffer();
-    auto& req_buffer       = *req_buffer_guard;
+    // A fresh request buffer per call — owned solely by this coroutine frame,
+    // so there is no shared/pooled state to race with concurrent invokes.
+    // (The allocation is negligible next to the network round-trip.)
+    buffer_type req_buffer;
 
     message_request<typename std::decay<ArgsT>::type...> request{std::make_tuple(std::forward<ArgsT>(args)...)};
 
@@ -116,8 +193,7 @@ public:
       throw std::runtime_error("Failed to encode request");
     }
 
-    // Fix: Pass const reference, not moved buffer
-    auto rsp_buffer = co_await client_session_->call(func_name, req_buffer);
+    auto rsp_buffer = co_await session->call(func_name, req_buffer, timeout);
 
     message_response<typename std::decay<ReturnT>::type> response;
 
@@ -189,10 +265,15 @@ public:
       }
     };
 
-    auto hash_value                    = shash64(notification_name).value();
-    notification_handlers_[hash_value] = std::move(wrapper);
+    auto   hash_value = shash64(notification_name).value();
+    size_t total;
+    {
+      std::lock_guard<std::mutex> lock(notification_mutex_);
+      notification_handlers_[hash_value] = std::move(wrapper);
+      total                              = notification_handlers_.size();
+    }
     spdlog::info("RPC: registered notification handler '{}' hash=0x{:X} (total={})",
-                  notification_name, hash_value, notification_handlers_.size());
+                  notification_name, hash_value, total);
   }
 
   // Automatic type deduction for lambdas and function objects (like server's attach!)
@@ -203,19 +284,23 @@ public:
 
   void unregister_notification_handler(std::string const& notification_name) {
     auto hash_value = shash64(notification_name).value();
+    std::lock_guard<std::mutex> lock(notification_mutex_);
     notification_handlers_.erase(hash_value);
   }
 
   void clear_notification_handlers() {
+    std::lock_guard<std::mutex> lock(notification_mutex_);
     notification_handlers_.clear();
   }
 
   bool has_notification_handler(std::string const& notification_name) const {
     auto hash_value = shash64(notification_name).value();
+    std::lock_guard<std::mutex> lock(notification_mutex_);
     return notification_handlers_.find(hash_value) != notification_handlers_.end();
   }
 
   size_t notification_handler_count() const {
+    std::lock_guard<std::mutex> lock(notification_mutex_);
     return notification_handlers_.size();
   }
 
@@ -228,7 +313,7 @@ public:
   }
 
   bool is_connected() const noexcept {
-    return client_session_ != nullptr;
+    return client_session_.load() != nullptr;
   }
 
   // Non-blocking keepalive. Returns false if no session or the write channel
@@ -237,7 +322,8 @@ public:
   // idle_timeouts from firing — the server replies with msg_type::pong so a
   // single client-side ping resets *both* read deadlines.
   bool try_ping() {
-    return client_session_ && client_session_->try_ping();
+    auto session = client_session_.load();
+    return session && session->try_ping();
   }
 
   void disconnect() {
@@ -246,25 +332,21 @@ public:
     // inside dispatch_requests(), the server keeps streaming notifications,
     // and every one of them logs "unhandled notification" because we've cleared
     // notification_handlers_ below.
-    if (client_session_) {
-      client_session_->close();
+    auto session = client_session_.exchange(nullptr);
+    if (session) {
+      session->close();
     }
-    client_session_.reset();
     function_hash_cache_.clear();
-    notification_handlers_.clear();
+    {
+      std::lock_guard<std::mutex> lock(notification_mutex_);
+      notification_handlers_.clear();
+    }
   }
 
   struct performance_stats {
-    size_t total_calls        = 0;
-    size_t buffer_pool_hits   = 0;
-    size_t buffer_pool_misses = 0;
-    size_t hash_cache_hits    = 0;
-    size_t hash_cache_misses  = 0;
-
-    double buffer_pool_hit_ratio() const {
-      auto total = buffer_pool_hits + buffer_pool_misses;
-      return total > 0 ? static_cast<double>(buffer_pool_hits) / total : 0.0;
-    }
+    size_t total_calls       = 0;
+    size_t hash_cache_hits   = 0;
+    size_t hash_cache_misses = 0;
 
     double hash_cache_hit_ratio() const {
       auto total = hash_cache_hits + hash_cache_misses;
@@ -274,11 +356,9 @@ public:
 
   performance_stats get_performance_stats() const {
     performance_stats stats;
-    stats.total_calls        = total_calls_;
-    stats.buffer_pool_hits   = buffer_pool_->hit_count();
-    stats.buffer_pool_misses = buffer_pool_->miss_count();
-    stats.hash_cache_hits    = hash_cache_hits_;
-    stats.hash_cache_misses  = hash_cache_misses_;
+    stats.total_calls       = total_calls_;
+    stats.hash_cache_hits   = hash_cache_hits_;
+    stats.hash_cache_misses = hash_cache_misses_;
     return stats;
   }
 
@@ -296,8 +376,8 @@ private:
     return hash_value;
   }
 
-  void setup_notification_handling() {
-    if (!client_session_) {
+  void setup_notification_handling(std::shared_ptr<session_type> const& session) {
+    if (!session) {
       return;
     }
 
@@ -306,32 +386,55 @@ private:
       handle_notification(call_id, buffer);
     };
 
-    client_session_->set_notification_callback(std::move(notification_callback));
+    session->set_notification_callback(std::move(notification_callback));
   }
 
   void handle_notification(std::uint64_t call_id, buffer_type const& buffer) {
-    auto it = notification_handlers_.find(call_id);
-    if (it != notification_handlers_.end()) {
+    // Copy the handler out under the lock, then invoke it UNLOCKED. This
+    // dispatch runs on the session's notification path (pool/strand) while
+    // disconnect()/clear() can be mutating the map on another thread — a
+    // concurrent find vs erase/rehash on the unordered_map is a heap-corrupting
+    // data race. Copying out also means a concurrent clear() can't invalidate
+    // the iterator under the handler call.
+    notification_handler_type handler;
+    {
+      std::lock_guard<std::mutex> lock(notification_mutex_);
+      auto it = notification_handlers_.find(call_id);
+      if (it != notification_handlers_.end()) {
+        handler = it->second;
+      }
+    }
+    if (handler) {
       try {
-        it->second(buffer);
+        handler(buffer);
       } catch (const std::exception& e) {
         spdlog::error("Error in notification handling: {}", e.what());
       } catch (...) {
         spdlog::error("Unknown error in notification handling");
       }
     } else {
-      spdlog::warn("RPC: unhandled notification call_id=0x{:X}, buffer={} bytes, registered_handlers={}",
-                    call_id, buffer.size(), notification_handlers_.size());
+      spdlog::warn("RPC: unhandled notification call_id=0x{:X}, buffer={} bytes", call_id, buffer.size());
     }
   }
 
 private:
   ChannelT                      channel_;
-  std::shared_ptr<session_type> client_session_;
-
-  std::unique_ptr<buffer_pool> buffer_pool_;
+  // Accessed concurrently: invoke() coroutines read it on the RPC worker pool
+  // while connect()/disconnect()/the dispatch-completion handler reset it. A
+  // plain shared_ptr here is a data race — a torn read hands call() a null or
+  // half-valid session pointer (the SIGSEGV in async_manager::create_operation
+  // and the cereal bufferbuf::underflow heap corruption both trace back here).
+  // synchronized_shared_ptr makes every access mutex-synchronized, and loading
+  // it into a local keeps the session alive for the duration of an in-flight
+  // call. (std::atomic<shared_ptr> would be ideal but the Android NDK's libc++
+  // doesn't implement that C++20 specialization — see the type's comment.)
+  synchronized_shared_ptr<session_type> client_session_;
 
   std::unordered_map<std::string, std::uint64_t>               function_hash_cache_;
+  // Guards notification_handlers_: dispatched (read) on the session's
+  // notification path while register/clear/disconnect mutate it on other
+  // threads. A concurrent find vs erase/rehash corrupts the map.
+  mutable std::mutex                                           notification_mutex_;
   std::unordered_map<std::uint64_t, notification_handler_type> notification_handlers_;
 
   mutable std::atomic<size_t> total_calls_{0};

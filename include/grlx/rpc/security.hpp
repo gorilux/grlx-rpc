@@ -166,6 +166,15 @@ struct client_context {
   // Empty / default-constructed when no session is bound (e.g.
   // unit-test direct dispatch).
   std::function<void(std::string)> set_logical_session_id;
+
+  // The authenticated, stable device identity bound to this session at handshake
+  // (entt_ext::sync stamps it from handshake_request.device_id after auth
+  // succeeds). This is the value authorization checks should trust — unlike a
+  // per-request device_id in an application payload, it is fixed for the session
+  // and cannot be swapped per-call. Empty until the handshake sets it.
+  std::string                      logical_device_id;
+  // Callback for the handshake handler to stamp that device id onto the session.
+  std::function<void(std::string)> set_logical_device_id;
 };
 
 // How strictly should the dispatcher gate a method?

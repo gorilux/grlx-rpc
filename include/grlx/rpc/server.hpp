@@ -109,8 +109,6 @@ public:
     asio::co_spawn(
         executor,
         [this]() -> asio::awaitable<void> {
-          auto executor = co_await asio::this_coro::executor;
-
           for (;;) {
             try {
               auto session = co_await channel_.accept(dispatcher_, session_limits_);
@@ -156,10 +154,13 @@ public:
                 }
               }
 
-              // Create individual strand for each session
-              auto session_strand = asio::make_strand(executor);
-
-              asio::co_spawn(session_strand, session->dispatch_requests(), [session, this, session_token](std::exception_ptr error) {
+              // Spawn dispatch_requests on the session's own I/O strand (built by
+              // the channel over the socket's io_context). dispatch_requests
+              // relies on its spawn executor to serialize msg_reader/msg_writer —
+              // SSL is not safe for concurrent read+write. Using the session's
+              // io_executor() (instead of a separate make_strand) keeps a single
+              // I/O strand per session and matches the client.
+              asio::co_spawn(session->io_executor(), session->dispatch_requests(), [session, this, session_token](std::exception_ptr error) {
                 // Release the seat we took in the global + per-IP counters
                 // so a future connect from this IP isn't wrongly rejected.
                 global_session_count_.fetch_sub(1, std::memory_order_acq_rel);

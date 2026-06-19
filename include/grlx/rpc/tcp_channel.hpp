@@ -119,7 +119,12 @@ public:
       }
     }
 
-    auto sess = std::make_shared<session_type>(std::move(tcp_socket), std::forward<ArgsT>(args)...);
+    // Plain TCP allows one concurrent read + one concurrent write, so the
+    // session's stream I/O needs no strand — hand it the raw socket executor.
+    // (SSL is the case that needs a strand; see ssl_channel.) Read the executor
+    // before the socket is moved into the session.
+    auto io_executor = tcp_socket.get_executor();
+    auto sess = std::make_shared<session_type>(std::move(tcp_socket), io_executor, std::forward<ArgsT>(args)...);
     if (!ep_ec) {
       sess->set_peer_ip(peer.address().to_string());
       sess->set_peer_address(peer.address().to_string() + ":" + std::to_string(peer.port()));
@@ -142,7 +147,8 @@ public:
     auto        executor = co_await asio::this_coro::executor;
     tcp::socket tcp_socket(executor);
     co_await tcp_socket.async_connect(endpoint, asio::use_awaitable);
-    co_return std::make_shared<session_type>(std::move(tcp_socket));
+    auto io_executor = tcp_socket.get_executor();
+    co_return std::make_shared<session_type>(std::move(tcp_socket), io_executor);
   }
 
 private:

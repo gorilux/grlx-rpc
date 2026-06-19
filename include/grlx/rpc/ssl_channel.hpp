@@ -8,6 +8,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -267,7 +268,12 @@ public:
     tcp::endpoint remote;
     boost::system::error_code ep_ec;
     remote = ssl_sock.lowest_layer().remote_endpoint(ep_ec);
-    auto sess = std::make_shared<session_type>(std::move(ssl_sock), std::forward<ArgsT>(args)...);
+    // SSL_read / SSL_write share OpenSSL state and must never run concurrently,
+    // so hand the session a strand to bind its stream I/O to. This is the SSL
+    // transport's concern, which is why it lives here and not in the generic
+    // session. Computed before the socket is moved into the session.
+    auto io_strand = asio::make_strand(ssl_sock.get_executor());
+    auto sess = std::make_shared<session_type>(std::move(ssl_sock), io_strand, std::forward<ArgsT>(args)...);
     sess->set_peer_fingerprint(std::move(info));
     if (!ep_ec) {
       sess->set_peer_ip(remote.address().to_string());
@@ -293,7 +299,10 @@ public:
     ssl_socket ssl_sock(executor, ssl_ctx_);
     co_await ssl_sock.next_layer().async_connect(endpoint, asio::use_awaitable);
     co_await race_handshake(ssl_sock, asio::ssl::stream_base::client);
-    co_return std::make_shared<session_type>(std::move(ssl_sock));
+    // Bind the session's stream I/O to a strand — SSL is not safe for
+    // concurrent SSL_read/SSL_write (see the accept() path for the rationale).
+    auto io_strand = asio::make_strand(ssl_sock.get_executor());
+    co_return std::make_shared<session_type>(std::move(ssl_sock), io_strand);
   }
 
 private:
