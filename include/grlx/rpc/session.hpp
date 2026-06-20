@@ -192,6 +192,22 @@ public:
       spdlog::error("rpc::session::dispatch_requests: socket is not open, aborting");
       co_return;
     }
+
+    // Disable Nagle's algorithm. This is a request/response protocol layered
+    // over TLS: small control messages (handshake, pings, signature/delta
+    // requests, per-chunk pull requests, commit acks) and the trailing partial
+    // segment of every bulk write would otherwise sit in the kernel waiting for
+    // a delayed ACK (up to ~40 ms), collapsing throughput on an otherwise fast
+    // link to a fraction of capacity. Both client and server reach dispatch on
+    // a connected socket, so set it once here for every session. Best-effort:
+    // a failure to set it is not fatal.
+    {
+      boost::system::error_code nd_ec;
+      stream_.lowest_layer().set_option(asio::ip::tcp::no_delay(true), nd_ec);
+      if (nd_ec) {
+        log_error_async("could not set TCP_NODELAY (peer=" + peer_address_ + "): " + nd_ec.message());
+      }
+    }
     // Keep the session alive for the entire lifetime of the reader/writer
     // coroutines. Both msg_reader() and msg_writer() capture `this` via their
     // member-function awaitables, so if the owning shared_ptr is released
