@@ -154,6 +154,13 @@ public:
   void set_logical_device_id(std::string id) { logical_device_id_ = std::move(id); }
   std::string const& logical_device_id() const noexcept { return logical_device_id_; }
 
+  // Authenticated role, stamped by the application's handshake handler after
+  // auth succeeds (see client_context::set_logical_role). -1 until then, which
+  // the dispatch auth_callback reads as "unauthenticated" to deny non-public
+  // methods. 0 = user, 1 = admin.
+  void set_logical_role(int r) { logical_role_ = r; }
+  int  logical_role() const noexcept { return logical_role_; }
+
   auto call(std::string const& call_name, buffer_type const& req_buffer, std::chrono::milliseconds timeout = std::chrono::seconds(30))
       -> asio::awaitable<buffer_type> {
 
@@ -592,6 +599,9 @@ private:
             client_context ctx{
                 .peer_fingerprint = self->peer_fingerprint_,
                 .peer_address     = self->peer_address_,
+                // The session id already bound at handshake; handlers read this
+                // to bind push subscriptions to the caller's own session.
+                .logical_session_id = self->logical_session_id_,
                 .set_logical_session_id = [weak_self](std::string id) {
                   if (auto s = weak_self.lock()) {
                     s->set_logical_session_id(std::move(id));
@@ -604,6 +614,15 @@ private:
                 .set_logical_device_id = [weak_self](std::string id) {
                   if (auto s = weak_self.lock()) {
                     s->set_logical_device_id(std::move(id));
+                  }
+                },
+                // The authenticated role bound at handshake; the dispatcher's
+                // enforce_auth reads this to gate authenticated/admin methods.
+                // The setter lets the handshake handler stamp it after auth.
+                .logical_role = self->logical_role_,
+                .set_logical_role = [weak_self](int r) {
+                  if (auto s = weak_self.lock()) {
+                    s->set_logical_role(r);
                   }
                 },
             };
@@ -824,6 +843,7 @@ private:
   std::string                      peer_ip_;
   std::string                      logical_session_id_;
   std::string                      logical_device_id_;
+  int                              logical_role_ = -1; // -1 = unauthenticated; 0 = user, 1 = admin (WI-3)
   token_bucket                     request_bucket_;
 };
 

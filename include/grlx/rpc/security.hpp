@@ -161,6 +161,14 @@ struct client_context {
   std::string peer_fingerprint;
   std::string peer_address;
 
+  // The logical session id bound to this session at handshake. Exposed as a
+  // VALUE (not just the setter below) so handlers can bind a push subscription
+  // (e.g. camera media via server::notify_session) to the caller's OWN
+  // authenticated session, instead of trusting a session_id passed in the RPC
+  // body — which any caller could set to another session. Empty until the
+  // handshake stamps it.
+  std::string                      logical_session_id;
+
   // Non-throwing callback bound to the calling session. Tags the
   // session with a logical id that `server::notify_session` filters on.
   // Empty / default-constructed when no session is bound (e.g.
@@ -175,6 +183,16 @@ struct client_context {
   std::string                      logical_device_id;
   // Callback for the handshake handler to stamp that device id onto the session.
   std::function<void(std::string)> set_logical_device_id;
+
+  // The authenticated role bound to this session at handshake (WI-3). A value
+  // < 0 means this session has NOT completed a successful auth handshake — the
+  // dispatch auth_callback treats that as unauthenticated and denies every
+  // non-public method. 0 = user, 1 = admin (matches handshake_response::role).
+  // Fixed for the session; unlike a per-request field it cannot be forged
+  // per-call. The handshake handler stamps it once via set_logical_role after
+  // auth succeeds.
+  int                              logical_role = -1;
+  std::function<void(int)>         set_logical_role;
 };
 
 // How strictly should the dispatcher gate a method?

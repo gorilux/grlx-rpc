@@ -5,6 +5,8 @@
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -105,58 +107,65 @@ public:
   asio::awaitable<void> connect(EndpointT const& endpoint) {
     auto executor = co_await asio::this_coro::executor;
 
-    auto session = co_await channel_.connect(endpoint);
+    // Run the ENTIRE connect + handshake flow on ONE strand. The caller's
+    // executor is typically the bare multi-threaded concurrent_io_context;
+    // without the strand, the daemon crash-loops on Android the moment
+    // async_connect completes (SIGSEGV in reactive_socket_connect_op::
+    // do_complete -> awaitable pump -> connect.resume, tiny fault addrs, scudo
+    // heap corruption). EMPIRICALLY REQUIRED on Android NDK: with the strand
+    // (plus the sync_client reconcile registry-race fix) a 45GB/3429-file
+    // upload ran flawlessly; reverting only the strand brought the crash back
+    // at the exact original location. Desktop ASan/TSan see nothing either
+    // way, so the precise mechanism is unproven — do NOT remove this without
+    // an on-device crash-free connect+sync run. dispatch_requests (the
+    // steady-state RPC loop) still runs on the session's OWN strand
+    // (io_executor()), so post-connect concurrency is unchanged.
+    co_await asio::co_spawn(
+        asio::make_strand(executor),
+        [this, endpoint]() -> asio::awaitable<void> {
+          auto session = co_await channel_.connect(endpoint);
 
-    // Descend to the TCP socket via lowest_layer() so the check works for both
-    // plain tcp_channel and ssl_channel (where next_layer() is ssl::stream).
-    if (!session || !session->next_layer().lowest_layer().is_open()) {
-      client_session_.store(nullptr);
-      throw std::runtime_error("rpc::client::connect: invalid session after connect");
-    }
-
-    co_await session->handshake();
-
-    // Publish the session only after the handshake succeeds. Set up notification
-    // handling against the local session (not the member) so a concurrent
-    // disconnect can't null it out from under us here.
-    setup_notification_handling(session);
-    client_session_.store(session);
-
-    // Spawn dispatch_requests on the session's I/O executor (io_executor()),
-    // NOT the bare socket executor. dispatch_requests relies on its spawn
-    // executor to serialize msg_reader/msg_writer — SSL is not safe for
-    // concurrent SSL_read/SSL_write, and spawning on the raw multi-threaded
-    // socket executor let them race and corrupt TLS records under the push flood
-    // ("bad record mac"). io_executor() is a strand over the socket's own
-    // io_context (ssl_channel builds it from the socket executor), so reactor
-    // affinity is preserved — the socket is still driven by the io_context it was
-    // registered with (no null reactor_data crash on Android), just serialized.
-    auto io_executor = session->io_executor();
-    asio::co_spawn(io_executor, session->dispatch_requests(),
-      [this, weak_session = std::weak_ptr<session_type>(session)](std::exception_ptr error) {
-        if (error) {
-          try {
-            std::rethrow_exception(error);
-          } catch (std::exception const& e) {
-            spdlog::error("rpc::client::dispatch_requests error: {}", e.what());
-          } catch (...) {
-            spdlog::error("rpc::client::dispatch_requests unknown error");
+          // Descend to the TCP socket via lowest_layer() so the check works for
+          // both plain tcp_channel and ssl_channel (next_layer() is ssl::stream).
+          if (!session || !session->next_layer().lowest_layer().is_open()) {
+            client_session_.store(nullptr);
+            throw std::runtime_error("rpc::client::connect: invalid session after connect");
           }
-        }
-        // Session is dead — clear it so is_connected() returns false and the
-        // health-check system can trigger reconnection. Only clear if this is
-        // still the *current* session: after disconnect()+reconnect(), the
-        // old session's completion handler can fire after the new session is
-        // installed, and we must not clobber it.
-        auto self = weak_session.lock();
-        if (self) {
-          // Only clear if this is still the current session — compare_exchange
-          // makes the check-and-clear atomic so it can't clobber a session
-          // installed by a concurrent reconnect.
-          std::shared_ptr<session_type> expected = self;
-          client_session_.compare_exchange_strong(expected, nullptr);
-        }
-      });
+
+          co_await session->handshake();
+
+          // Publish the session only after the handshake succeeds.
+          setup_notification_handling(session);
+          client_session_.store(session);
+
+          // Spawn dispatch_requests on the session's OWN I/O executor
+          // (io_executor() = a strand over the socket's io_context) — SSL is not
+          // safe for concurrent SSL_read/SSL_write, so this serializes the
+          // msg_reader/msg_writer while preserving reactor affinity.
+          auto io_executor = session->io_executor();
+          asio::co_spawn(io_executor, session->dispatch_requests(),
+            [this, weak_session = std::weak_ptr<session_type>(session)](std::exception_ptr error) {
+              if (error) {
+                try {
+                  std::rethrow_exception(error);
+                } catch (std::exception const& e) {
+                  spdlog::error("rpc::client::dispatch_requests error: {}", e.what());
+                } catch (...) {
+                  spdlog::error("rpc::client::dispatch_requests unknown error");
+                }
+              }
+              // Session is dead — clear it so is_connected() returns false and
+              // the health-check reconnects. compare_exchange so a completion
+              // from an OLD session can't clobber one installed by a concurrent
+              // reconnect.
+              auto self = weak_session.lock();
+              if (self) {
+                std::shared_ptr<session_type> expected = self;
+                client_session_.compare_exchange_strong(expected, nullptr);
+              }
+            });
+        },
+        asio::use_awaitable);
 
     co_return;
   }
