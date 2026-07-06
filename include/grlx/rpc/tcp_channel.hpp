@@ -2,7 +2,10 @@
 
 #include "session.hpp"
 
+#include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include <functional>
 #include <stdexcept>
@@ -104,8 +107,11 @@ public:
     pre_filter_ = std::move(f);
   }
 
-  template <typename... ArgsT>
-  auto accept(ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
+  // Accept a raw TCP socket + run the pre-session filter. Mirrors
+  // ssl_channel::accept_raw so the server's decoupled accept loop (WI-9) is
+  // channel-agnostic. Plain TCP has no handshake, but the split keeps a uniform
+  // interface. Throws tcp_connection_rejected_error when the filter denies.
+  auto accept_raw() -> asio::awaitable<tcp::socket> {
     auto tcp_socket = co_await acceptor_->async_accept(asio::use_awaitable);
 
     boost::system::error_code ep_ec;
@@ -118,7 +124,15 @@ public:
         throw tcp_connection_rejected_error(reason.empty() ? "filter denied" : reason);
       }
     }
+    co_return tcp_socket;
+  }
 
+  // Build the session from a pre-accepted socket. No TLS handshake for plain
+  // TCP; the name matches ssl_channel::handshake for a uniform accept loop.
+  template <typename... ArgsT>
+  auto handshake(tcp::socket&& tcp_socket, ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
+    boost::system::error_code ep_ec;
+    auto                      peer = tcp_socket.remote_endpoint(ep_ec);
     // Plain TCP allows one concurrent read + one concurrent write, so the
     // session's stream I/O needs no strand — hand it the raw socket executor.
     // (SSL is the case that needs a strand; see ssl_channel.) Read the executor
@@ -130,6 +144,13 @@ public:
       sess->set_peer_address(peer.address().to_string() + ":" + std::to_string(peer.port()));
     }
     co_return sess;
+  }
+
+  // Convenience: accept + build in one step. Kept for tests and non-decoupled callers.
+  template <typename... ArgsT>
+  auto accept(ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
+    auto sock = co_await accept_raw();
+    co_return co_await handshake(std::move(sock), std::forward<ArgsT>(args)...);
   }
 
   auto connect(std::string const& address) -> asio::awaitable<std::shared_ptr<session_type>> {
@@ -146,7 +167,17 @@ public:
   auto connect(tcp::endpoint const& endpoint) -> asio::awaitable<std::shared_ptr<session_type>> {
     auto        executor = co_await asio::this_coro::executor;
     tcp::socket tcp_socket(executor);
-    co_await tcp_socket.async_connect(endpoint, asio::use_awaitable);
+
+    // Non-throwing TCP connect — see ssl_channel::connect for the full
+    // rationale. A throwing async_connect crashes on Android during the
+    // coroutine unwind on the connect-FAILURE path (esp. immediate
+    // ECONNREFUSED). Return a null session on error instead.
+    auto [ec] = co_await tcp_socket.async_connect(endpoint, asio::as_tuple(asio::use_awaitable));
+    if (ec) {
+      co_await asio::post(executor, asio::use_awaitable);
+      co_return nullptr;
+    }
+
     auto io_executor = tcp_socket.get_executor();
     co_return std::make_shared<session_type>(std::move(tcp_socket), io_executor);
   }

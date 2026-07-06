@@ -3,12 +3,15 @@
 #include "security.hpp"
 #include "session.hpp"
 
+#include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -111,6 +114,23 @@ inline void add_client_ca_list_from_pem(SSL_CTX* ctx, std::string const& ca_pem)
   SSL_CTX_set_client_CA_list(ctx, names);
 }
 
+// Add EVERY certificate in a PEM bundle to the context's verify store. asio's
+// ctx.add_certificate_authority() reads only the FIRST cert in a buffer, so it
+// cannot pin more than one anchor. This loads them all — required for a
+// root-CA rotation transition where the client trusts both the new root CA and
+// the legacy leaf that already-deployed peers still present (WI-14).
+inline void add_all_cas_from_pem(asio::ssl::context& ctx, std::string const& ca_pem) {
+  if (ca_pem.empty()) return;
+  auto* bio = BIO_new_mem_buf(ca_pem.data(), static_cast<int>(ca_pem.size()));
+  if (!bio) return;
+  X509_STORE* store = SSL_CTX_get_cert_store(ctx.native_handle());
+  while (X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) {
+    (void)X509_STORE_add_cert(store, cert);  // returns 0 for a duplicate — harmless
+    X509_free(cert);
+  }
+  BIO_free(bio);
+}
+
 // SHA-256 of a peer X.509 cert in DER, as lowercase hex.
 inline std::string fingerprint_sha256(X509* cert) {
   if (!cert) return {};
@@ -180,7 +200,9 @@ inline asio::ssl::context make_client_context(std::string const& cert_pem,
     ctx.use_private_key(asio::buffer(key_pem), asio::ssl::context::pem);
   }
   if (!ca_pem.empty()) {
-    ctx.add_certificate_authority(asio::buffer(ca_pem));
+    // WI-14: load EVERY anchor in the bundle (asio adds only the first), so the
+    // client can pin a root CA plus a legacy leaf during a rotation transition.
+    detail::add_all_cas_from_pem(ctx, ca_pem);
   }
   return ctx;
 }
@@ -194,9 +216,11 @@ public:
   using session_type  = session<ssl_socket, EncoderT>;
   using executor_type = tcp::acceptor::executor_type;
 
-  // Default 5 s caps the worst case for a legitimate handshake on a slow
-  // network. Lower it in tests; raise only if you understand the DoS risk.
-  static constexpr std::chrono::milliseconds kDefaultHandshakeTimeout{5000};
+  // Caps the worst case for a legitimate handshake on a slow network. Kept
+  // tight (WI-9) because the accept loop now runs handshakes off-loop and a
+  // shorter deadline evicts stalling peers from the in-flight budget sooner.
+  // Lower it in tests; raise only if you understand the DoS risk.
+  static constexpr std::chrono::milliseconds kDefaultHandshakeTimeout{3000};
 
   ssl_channel(asio::ssl::context ctx, std::chrono::milliseconds handshake_timeout = kDefaultHandshakeTimeout)
     : ssl_ctx_(std::move(ctx))
@@ -241,8 +265,12 @@ public:
     pre_filter_ = std::move(f);
   }
 
-  template <typename... ArgsT>
-  auto accept(ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
+  // Accept a raw TCP socket and run the cheap pre-handshake filter. Does NOT
+  // run the TLS handshake (WI-9) — the server accepts these serially on the
+  // acceptor and hands the slow handshake off to a per-connection coroutine via
+  // handshake() below, so one stalling peer cannot starve new accepts. Throws
+  // connection_rejected_error when the filter denies the peer.
+  auto accept_raw() -> asio::awaitable<tcp::socket> {
     auto tcp_sock = co_await acceptor_->async_accept(asio::use_awaitable);
 
     // Drop at the cheap TCP layer when the filter says so, before we pay
@@ -258,7 +286,15 @@ public:
         throw connection_rejected_error(reason.empty() ? "filter denied" : reason);
       }
     }
+    co_return tcp_sock;
+  }
 
+  // Complete a pre-accepted connection: run the TLS handshake (bounded by the
+  // handshake timeout) and build the session. Slow; the server runs this off
+  // the accept loop. Concurrent handshakes each operate on their own ssl_socket,
+  // so running many at once is safe.
+  template <typename... ArgsT>
+  auto handshake(tcp::socket&& tcp_sock, ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
     ssl_socket ssl_sock(std::move(tcp_sock), ssl_ctx_);
     co_await race_handshake(ssl_sock, asio::ssl::stream_base::server);
     // Capture the peer's cert fingerprint + endpoint *before* moving the
@@ -282,6 +318,14 @@ public:
     co_return sess;
   }
 
+  // Convenience: accept + handshake in one step. Kept for tests and callers
+  // that don't need the decoupled accept loop.
+  template <typename... ArgsT>
+  auto accept(ArgsT&&... args) -> asio::awaitable<std::shared_ptr<session_type>> {
+    auto sock = co_await accept_raw();
+    co_return co_await handshake(std::move(sock), std::forward<ArgsT>(args)...);
+  }
+
   auto connect(std::string const& address) -> asio::awaitable<std::shared_ptr<session_type>> {
     auto          executor = co_await asio::this_coro::executor;
     tcp::resolver resolver(executor);
@@ -297,7 +341,26 @@ public:
   auto connect(tcp::endpoint const& endpoint) -> asio::awaitable<std::shared_ptr<session_type>> {
     auto       executor = co_await asio::this_coro::executor;
     ssl_socket ssl_sock(executor, ssl_ctx_);
-    co_await ssl_sock.next_layer().async_connect(endpoint, asio::use_awaitable);
+
+    // Non-throwing TCP connect. Letting async_connect THROW here
+    // (use_awaitable) crashes on Android during the coroutine-frame unwind
+    // when the connect FAILS — most reliably on an immediate ECONNREFUSED
+    // (a refused loopback/LAN port), where the completion is delivered inline
+    // and the exception tears down `ssl_sock` while the connect op is still
+    // on the stack (SIGSEGV in reactive_socket_connect_op::do_complete ->
+    // awaitable pump -> connect.resume). Offline-first clients hit this path
+    // every time the server is unreachable, so it MUST NOT crash — take the
+    // error_code form and fail by returning a null session instead. The
+    // caller (client::connect) treats a null session as a connect failure.
+    auto [ec] = co_await ssl_sock.next_layer().async_connect(endpoint, asio::as_tuple(asio::use_awaitable));
+    if (ec) {
+      // Hop off the (possibly inline) completion stack before ssl_sock is
+      // destroyed, so its teardown can never race the connect op unwinding
+      // beneath us.
+      co_await asio::post(executor, asio::use_awaitable);
+      co_return nullptr;
+    }
+
     co_await race_handshake(ssl_sock, asio::ssl::stream_base::client);
     // Bind the session's stream I/O to a strand — SSL is not safe for
     // concurrent SSL_read/SSL_write (see the accept() path for the rationale).

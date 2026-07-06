@@ -108,10 +108,41 @@ public:
 
     asio::co_spawn(
         executor,
-        [this]() -> asio::awaitable<void> {
+        [this, executor]() -> asio::awaitable<void> {
           for (;;) {
             try {
-              auto session = co_await channel_.accept(dispatcher_, session_limits_);
+              // Fast: accept a raw TCP socket + run the cheap pre-handshake
+              // filter. The slow TLS handshake is handed off below (WI-9) so a
+              // stalling peer cannot starve new accepts.
+              auto sock = co_await channel_.accept_raw();
+
+              // Bound half-open handshakes so the decoupling can't let a flood
+              // pin unbounded sockets/buffers. Excess is dropped at the TCP layer.
+              if (handshakes_in_flight_.load(std::memory_order_acquire) >= limits_.max_concurrent_handshakes) {
+                boost::system::error_code ig;
+                sock.close(ig);
+                log_error_async("handshake in-flight cap reached; dropping connection");
+                continue;
+              }
+              handshakes_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+
+              asio::co_spawn(
+                  executor,
+                  [this, sock = std::move(sock)]() mutable -> asio::awaitable<void> {
+                    std::shared_ptr<session_type> session;
+                    try {
+                      session = co_await channel_.handshake(std::move(sock), dispatcher_, session_limits_);
+                    } catch (const std::exception& he) {
+                      handshakes_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+                      log_error_async(std::string("TLS handshake failed: ") + he.what());
+                      co_return;
+                    } catch (...) {
+                      handshakes_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+                      log_error_async("TLS handshake failed: unknown error");
+                      co_return;
+                    }
+                    handshakes_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+                    if (!session) co_return;
 
               // Admit the session: bump the global + per-IP counters that
               // back the pre-handshake filter. Order matters — we increment
@@ -210,6 +241,8 @@ public:
                   }());
                 }
               });
+                  },
+                  asio::detached);
 
             } catch (const std::exception& e) {
               // Log error asynchronously without blocking
@@ -487,6 +520,7 @@ private:
   session_close_callback                                          on_session_close_;
   server_limits                                                   limits_{};
   std::atomic<std::size_t>                                        global_session_count_{0};
+  std::atomic<std::size_t>                                        handshakes_in_flight_{0}; // WI-9: half-open TLS handshakes
   std::mutex                                                      per_ip_mutex_;
   std::unordered_map<std::string, std::size_t>                    per_ip_count_;
   std::unordered_map<std::string, token_bucket>                   per_ip_accept_bucket_;

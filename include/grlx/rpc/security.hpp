@@ -161,6 +161,10 @@ struct client_context {
   std::string peer_fingerprint;
   std::string peer_address;
 
+  // Just the source IP (no port), so per-IP rate limiting keys independently of
+  // the ephemeral source port (WI-15). Empty for non-transport dispatch.
+  std::string peer_ip;
+
   // The logical session id bound to this session at handshake. Exposed as a
   // VALUE (not just the setter below) so handlers can bind a push subscription
   // (e.g. camera media via server::notify_session) to the caller's OWN
@@ -279,6 +283,14 @@ struct server_limits {
   // Set capacity <= 0 to disable.
   double accept_burst_per_ip         = 20.0;  // token bucket capacity
   double accept_refill_per_ip_per_s  = 1.0;   // == 60/min
+
+  // Hard cap on TLS handshakes in flight at once (WI-9). The accept loop hands
+  // each handshake off to its own coroutine so a stalling peer can't starve new
+  // accepts; this bounds how many half-open handshakes (each holding a socket +
+  // buffers until the handshake timeout) a flood can pin at once. Excess
+  // connections are dropped at the cheap TCP layer. Generous for a small
+  // deployment, restrictive enough to cap memory under a distributed flood.
+  std::size_t max_concurrent_handshakes = 256;
 };
 
 }  // namespace grlx::rpc

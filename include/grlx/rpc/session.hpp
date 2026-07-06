@@ -166,9 +166,7 @@ public:
 
     auto call_id = shash64(call_name);
 
-    // Create a channel for this request (capacity 1)
-
-    // Register the channel and get a token
+    // Register the operation (token + response channel, capacity 1).
     auto async_op = async_manager_.create_operation();
 
     // Build and queue request
@@ -181,9 +179,58 @@ public:
 
     co_await queue_write(std::move(req_header), buffer_type(req_buffer));
 
-    // Wait for response with timeout (using built-in timeout support)
-    auto [ec, buffer] = co_await async_op.async_wait(timeout, asio::as_tuple(asio::use_awaitable));
+    // Wait for the response with a timeout — INLINE in this coroutine frame,
+    // using the same manual-timer + channel-cancel pattern as deadline_read.
+    //
+    // The previous implementation went through operation_token::async_wait,
+    // which co_spawned a DETACHED coroutine that captured the completion
+    // handler and then resumed this call() from there. That detached frame
+    // (plus its timer/channel) outlived and raced session teardown: when a
+    // session was closed while an RPC was in flight (server restart, WiFi
+    // blip mid-sync, or a rapid disconnect/reconnect), the cancel path and
+    // the detached-handler path could tear down the same state on two
+    // executors and double-free — a scudo "invalid chunk" / MTE
+    // "pointer tag truncated" SIGABRT on Android (glibc/desktop tolerated
+    // it, so sanitizers stayed clean). Same failure class that already
+    // forced deadline_read and msg_reader off awaitable_operators::||.
+    //
+    // Doing the wait here removes the detached frame entirely: it lives in
+    // this call() frame, which the caller (client::invoke_with_timeout)
+    // keeps alive via its session shared_ptr for the whole await. The
+    // response channel is a shared_ptr, so it stays valid even if the
+    // session's async_manager is torn down underneath us — a concurrent
+    // close()/cancel_all_operations() just cancels our async_receive, which
+    // we surface as a clean error instead of a crash.
+    auto ch = async_op.channel;
+    struct wait_state {
+      asio::steady_timer timer;
+      std::atomic<bool>  timed_out{false};
+      std::atomic<bool>  finished{false};
+      explicit wait_state(asio::any_io_executor ex) : timer(std::move(ex)) {}
+    };
+    auto executor = co_await asio::this_coro::executor;
+    auto st       = std::make_shared<wait_state>(executor);
+    st->timer.expires_after(timeout);
+    st->timer.async_wait([st, ch](boost::system::error_code ec) {
+      if (ec) return;                 // timer cancelled → response already received
+      if (st->finished.load()) return;
+      st->timed_out.store(true);
+      ch->cancel();                   // unblocks async_receive with operation_aborted
+    });
 
+    auto [channel_ec, result] = co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
+    st->finished.store(true);
+    st->timer.cancel();
+
+    if (st->timed_out.load()) {
+      throw std::runtime_error("RPC call timeout: " + call_name);
+    }
+    if (channel_ec) {
+      // Channel cancelled/closed by session teardown (disconnect / drop).
+      throw boost::system::system_error(channel_ec, "RPC call failed");
+    }
+
+    auto& [ec, buffer] = result;
     if (ec) {
       if (ec == asio::error::timed_out) {
         throw std::runtime_error("RPC call timeout: " + call_name);
@@ -191,7 +238,7 @@ public:
       throw boost::system::system_error(ec, "RPC call failed");
     }
 
-    co_return buffer;
+    co_return std::move(buffer);
   }
 
   auto dispatch_requests() -> asio::awaitable<void> {
@@ -599,6 +646,7 @@ private:
             client_context ctx{
                 .peer_fingerprint = self->peer_fingerprint_,
                 .peer_address     = self->peer_address_,
+                .peer_ip          = self->peer_ip_,
                 // The session id already bound at handshake; handlers read this
                 // to bind push subscriptions to the caller's own session.
                 .logical_session_id = self->logical_session_id_,
