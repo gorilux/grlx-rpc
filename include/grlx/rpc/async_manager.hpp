@@ -157,7 +157,20 @@ public:
         completion_token);
   }
 
-  // For cases where you need token first, then await
+  // Token + response channel handed back to the caller so it can await the
+  // response ITSELF, in its own coroutine frame.
+  //
+  // This deliberately no longer provides an `async_wait(...)` helper. The
+  // previous helpers co_spawned a DETACHED coroutine that captured the
+  // completion handler and resumed the caller from there; that detached
+  // frame (plus its timer/channel) outlived and raced session teardown and
+  // double-freed under scudo/MTE on Android when a session was closed while
+  // an RPC was in flight (server restart, WiFi blip, rapid reconnect). The
+  // caller (session::call) now runs the timed receive on `channel` inline —
+  // its frame is kept alive by the session shared_ptr for the whole await,
+  // and `channel` is a shared_ptr so a concurrent teardown just cancels the
+  // receive (surfaced as a clean error) instead of freeing state underneath
+  // a detached handler. See session::call for the pattern.
   struct operation_token {
     token_type  token;
     channel_ptr channel;
@@ -165,88 +178,6 @@ public:
     operation_token(token_type t, channel_ptr ch)
       : token(t)
       , channel(std::move(ch)) {
-    }
-
-    // async_wait without timeout
-    template <typename CompletionToken, typename ResultType = buffer_type>
-    auto async_wait(CompletionToken&& completion_token) {
-      return asio::async_initiate<CompletionToken, void(boost::system::error_code, ResultType)>(
-          [this](auto&& handler) {
-            auto ch = channel;
-            asio::co_spawn(
-                ch->get_executor(),
-                [ch, handler = std::decay_t<decltype(handler)>(std::forward<decltype(handler)>(handler))]() mutable -> asio::awaitable<void> {
-                  auto [channel_ec, result] = co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
-
-                  if (!channel_ec) {
-                    auto [ec, buffer] = std::move(result);
-                    handler(ec, std::move(buffer));
-                  } else {
-                    // Channel error (e.g., closed)
-                    handler(channel_ec, buffer_type{});
-                  }
-                },
-                asio::detached);
-          },
-          completion_token);
-    }
-
-    // async_wait with timeout.
-    //
-    // Deliberately does NOT use awaitable_operators::`||` / parallel_group to
-    // race the receive against the timer. Under SSL + the tight concurrent
-    // call loads the file_sync chunked transfer generates, parallel_group's
-    // per-call cancellation-state alloc/teardown corrupted the heap and
-    // aborted in scudo with a misaligned-pointer free (the
-    // ~parallel_group_op_handler crash session.hpp's deadline_read already
-    // had to migrate away from). Instead we run a manual deadline timer that
-    // cancels the channel on expiry — exactly the deadline_read pattern.
-    template <typename CompletionToken, typename ResultType = buffer_type>
-    auto async_wait(std::chrono::milliseconds timeout, CompletionToken&& completion_token) {
-      return asio::async_initiate<CompletionToken, void(boost::system::error_code, ResultType)>(
-          [this, timeout](auto&& handler) {
-            auto ch = channel;
-            asio::co_spawn(
-                ch->get_executor(),
-                [ch,
-                 timeout,
-                 handler = std::decay_t<decltype(handler)>(std::forward<decltype(handler)>(handler))]() mutable -> asio::awaitable<void> {
-                  // Shared between this coroutine and the timer callback, which
-                  // may run on a different worker thread of a multi-threaded
-                  // io_context — hence atomics, not plain bools.
-                  struct wait_state {
-                    asio::steady_timer timer;
-                    std::atomic<bool>  timed_out{false};
-                    std::atomic<bool>  finished{false};
-                    explicit wait_state(asio::any_io_executor ex) : timer(std::move(ex)) {}
-                  };
-                  auto st = std::make_shared<wait_state>(ch->get_executor());
-                  st->timer.expires_after(timeout);
-                  st->timer.async_wait([st, ch](boost::system::error_code ec) {
-                    if (ec) return;                 // timer cancelled → receive already completed
-                    if (st->finished.load()) return;
-                    st->timed_out.store(true);
-                    ch->cancel();                   // unblocks async_receive with operation_aborted
-                  });
-
-                  auto [channel_ec, data] =
-                      co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
-                  st->finished.store(true);
-                  st->timer.cancel();
-
-                  if (st->timed_out.load()) {
-                    handler(asio::error::timed_out, buffer_type{});
-                  } else if (!channel_ec) {
-                    auto [ec, buffer] = std::move(data);
-                    handler(ec, std::move(buffer));
-                  } else {
-                    // Channel error (e.g., closed / cancelled by teardown)
-                    handler(channel_ec, buffer_type{});
-                  }
-                },
-                asio::detached);
-          },
-          completion_token);
     }
   };
 
