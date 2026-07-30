@@ -42,10 +42,11 @@ endif
 # Public headers
 grlx_rpc_public_headers = include_directories('include')
 
-# Header-only library - no sources to compile
+# Header-only library — the single source is just an anchor TU, since meson
+# no longer allows a build target with an empty source list.
 grlx_rpc_target = static_library(
   'grlx-rpc',
-  sources: [],  # Header-only
+  sources: ['src/library_anchor.cpp'],
   dependencies: grlx_rpc_deps,
   include_directories: [
     grlx_rpc_public_headers,
