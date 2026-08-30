@@ -159,6 +159,21 @@ inline std::string peer_fingerprint(asio::ssl::stream<tcp::socket>& s) {
   return fp;
 }
 
+// Disable Nagle's algorithm on a freshly connected socket, before the TLS
+// handshake runs. session::dispatch_requests() sets the same option, but only
+// once the session exists — i.e. after the handshake has already completed.
+// Under mTLS the peer's second flight (Certificate + CertificateVerify +
+// Finished) leaves the trailing small segment parked in the kernel waiting on
+// a delayed ACK (~40 ms), which silently spends part of the handshake timeout
+// budget on every connect and every client reconnect. The option survives the
+// moves into ssl::stream and then into the session, so setting it here is
+// enough. Best-effort and deliberately silent: a failure recurs on the same
+// socket in dispatch_requests(), which logs it.
+inline void disable_nagle(tcp::socket& sock) {
+  boost::system::error_code ignored;
+  sock.set_option(asio::ip::tcp::no_delay(true), ignored);
+}
+
 }  // namespace detail
 
 // Build a server-side TLS context loaded with cert/key and a CA bundle that
@@ -286,6 +301,8 @@ public:
         throw connection_rejected_error(reason.empty() ? "filter denied" : reason);
       }
     }
+
+    detail::disable_nagle(tcp_sock);
     co_return tcp_sock;
   }
 
@@ -360,6 +377,8 @@ public:
       co_await asio::post(executor, asio::use_awaitable);
       co_return nullptr;
     }
+
+    detail::disable_nagle(ssl_sock.next_layer());
 
     co_await race_handshake(ssl_sock, asio::ssl::stream_base::client);
     // Bind the session's stream I/O to a strand — SSL is not safe for
